@@ -1,0 +1,66 @@
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <ProjectGuid>{9F0EAE63-99CB-4FDC-A772-12FBD4F512D3}</ProjectGuid>
+    <OutputType>Library</OutputType>
+    <RootNamespace>AIGFH</RootNamespace>
+    <AssemblyName>AIGFH</AssemblyName>
+    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+    <LangVersion>latest</LangVersion>
+    <FileAlignment>512</FileAlignment>
+    <RegisterForComInterop>false</RegisterForComInterop>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
+    <OutputPath>bin\Debug\</OutputPath>
+    <DefineConstants>DEBUG;TRACE</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
+    <OutputPath>bin\Release\</OutputPath>
+    <DefineConstants>TRACE</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\RibbonIcons\*.png" />
+    <EmbeddedResource Include="Resources\ProjectRepository.txt">
+      <LogicalName>AIGFH.ProjectRepository.txt</LogicalName>
+    </EmbeddedResource>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <Reference Include="Microsoft.CSharp" />
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
+    <Reference Include="System.Xml.Linq" />
+    <Reference Include="Extensibility">
+      <HintPath>References\Extensibility.dll</HintPath>
+      <EmbedInteropTypes>true</EmbedInteropTypes>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Office">
+      <HintPath>References\Office.dll</HintPath>
+      <EmbedInteropTypes>true</EmbedInteropTypes>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Connect.cs" />
+    <Compile Include="AiWebFormatter.cs" />
+    <Compile Include="OmmlMathBuilder.cs" />
+    <Compile Include="OmmlDocxFragment.cs" />
+    <Compile Include="OmmlToLatexConverter.cs" />
+    <Compile Include="OfficeDocumentService.cs" />
+    <Compile Include="NormalizationSettings.cs" />
+    <Compile Include="SettingsForm.cs" />
+    <Compile Include="RuleEditorForm.cs" />
+    <Compile Include="FormulaReviewForm.cs" />
+    <Compile Include="UpdateChecker.cs" />
+    <Compile Include="Properties\AssemblyInfo.cs" />
+  </ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>
