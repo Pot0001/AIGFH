@@ -2988,7 +2988,8 @@ public sealed class OfficeDocumentService
         value = value.Replace("\\dfrac", "\\frac").Replace("\\tfrac", "\\frac").Replace("\\cfrac", "\\frac");
         value = NormalizeBareFractionSyntax(value);
         value = NormalizeSingleArgumentCommands(value);
-        value = ReplaceTwoGroupCommand(value, "\\frac", (left, right) => "(" + ConvertAiLatexExpression(left) + ")/(" + ConvertAiLatexExpression(right) + ")");
+        value = ReplaceTwoGroupCommand(value, "\\frac", (left, right) =>
+            BuildLinearFraction(ConvertAiLatexExpression(left), ConvertAiLatexExpression(right)));
         value = ReplaceTwoGroupCommand(value, "\\binom", (top, bottom) => "\\binom(" + ConvertAiLatexExpression(top) + "," + ConvertAiLatexExpression(bottom) + ")");
         value = ReplaceGenfracCommand(value);
         value = ReplaceIndexedRootCommands(value);
@@ -3081,6 +3082,18 @@ public sealed class OfficeDocumentService
         return RemoveUnmatchedClosingParentheses(Regex.Replace(value, @"[ \t]+", " ").Trim());
     }
 
+    private static string BuildLinearFraction(string numerator, string denominator)
+    {
+        // UnicodeMath treats a bare "(a)/(b)" as a division whose numerator may
+        // extend back to the beginning of the surrounding expression.  This is
+        // especially visible in formulas such as
+        //   \exists\varphi,\forall x,...+2\sin\frac{\varphi}{2}
+        // where Word incorrectly places the whole quantified prefix in the
+        // numerator.  U+3016/U+3017 are UnicodeMath's invisible grouping marks:
+        // they keep the fraction as one atom without adding visible parentheses.
+        return "\u3016(" + (numerator ?? String.Empty) + ")/(" + (denominator ?? String.Empty) + ")\u3017";
+    }
+
     private static string NormalizeSingleArgumentCommands(string source)
     {
         return Regex.Replace(source ?? String.Empty,
@@ -3112,7 +3125,7 @@ public sealed class OfficeDocumentService
             var top = ConvertAiLatexExpression(groups[4]);
             var bottom = ConvertAiLatexExpression(groups[5]);
             var noBar = String.Equals(groups[2].Trim(), "0pt", StringComparison.OrdinalIgnoreCase);
-            var fraction = noBar ? "\\binom(" + top + "," + bottom + ")" : "(" + top + ")/(" + bottom + ")";
+            var fraction = noBar ? "\\binom(" + top + "," + bottom + ")" : BuildLinearFraction(top, bottom);
             if (!String.IsNullOrWhiteSpace(groups[0]) || !String.IsNullOrWhiteSpace(groups[1]))
                 fraction = ConvertAiLatexExpression(groups[0]) + fraction + ConvertAiLatexExpression(groups[1]);
             source = source.Substring(0, index) + fraction + source.Substring(cursor);

@@ -11,7 +11,7 @@ namespace AIGFH;
 
 internal static class UpdateChecker
 {
-    internal const string CurrentVersion = "1.1.2";
+    internal const string CurrentVersion = "1.1.3";
     internal static readonly string RepositoryPath = ReadRepositoryPath();
     internal static readonly string RepositoryUrl = "https://github.com/" + RepositoryPath;
 
