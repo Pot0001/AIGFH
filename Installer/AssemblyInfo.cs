@@ -6,6 +6,6 @@ using System.Runtime.InteropServices;
 [assembly: AssemblyCompany("AI规范化项目")]
 [assembly: AssemblyProduct("AI规范化")]
 [assembly: AssemblyCopyright("Copyright © 2026 AI规范化项目")]
-[assembly: AssemblyVersion("1.1.3.0")]
-[assembly: AssemblyFileVersion("1.1.3.0")]
+[assembly: AssemblyVersion("1.1.5.0")]
+[assembly: AssemblyFileVersion("1.1.5.0")]
 [assembly: ComVisible(false)]

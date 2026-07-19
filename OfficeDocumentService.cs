@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -240,9 +241,17 @@ public sealed class OfficeDocumentService
         if (!settings.NormalizePlainTextWithoutMarkers && !HasTextNormalizationMarkers(text)) return 0;
         // 已有原生公式时只在原位置删除 Markdown 标记并设置段落样式，
         // 不再重写整段文字，因此标题和列表仍能规范且公式对象保持不变。
-        if (RangeContainsOfficeMath(range))
+        if (RangeContainsOfficeMath(document, range))
         {
-            var changed = NormalizeMarkdownInPlace(document, range);
+            var changed = 0;
+            if (IsWpsDocument(document))
+            {
+                changed += NormalizeWpsTextStructureInPlace(document, range);
+                ResetWpsParagraphLayout(range);
+                ResetWpsTextStyle(range, settings);
+                changed += RemoveOuterMarkdownFenceInPlace(document, range);
+            }
+            changed += NormalizeMarkdownInPlace(document, range);
             FinishAiWebLayout(document, (int)range.Start, (int)range.End);
             SelectScopeRange(range, settings.ProcessingScope);
             return changed > 0 ? 1 : 0;
@@ -252,12 +261,13 @@ public sealed class OfficeDocumentService
         text = Regex.Replace(text, @"\$\s{1,3}([0-9A-Za-z']{1,8})\s{1,3}\$", "$$$1$$");
         text = NormalizeLatexDocumentStructure(text);
         if (!latexDocument) text = NormalizeUnifiedAiStructure(text);
+        if (IsWpsDocument(document)) text = NormalizeWpsParagraphMarks(text);
         var start = (int)range.Start;
         range.Text = text;
         // Word converts CRLF pairs to a single paragraph mark on assignment.
         // Reuse the adjusted COM range end instead of the source string length.
         range = document.Range(start, (int)range.End);
-        range = RenderMarkdownRangeAsWeb(document, range, true);
+        range = RenderMarkdownRangeAsWeb(document, range, true, settings);
         FinishAiWebLayout(document, (int)range.Start, (int)range.End);
         SelectScopeRange(range, settings.ProcessingScope);
         return 1;
@@ -276,10 +286,38 @@ public sealed class OfficeDocumentService
         dynamic range = GetAiWorkingRange(document, settings.AutoPaste, "Document");
         var text = (string)range.Text;
         if (String.IsNullOrWhiteSpace((text ?? String.Empty).Trim('\r', '\a'))) return 0;
-        if (RangeContainsOfficeMath(range))
+        if (RangeContainsOfficeMath(document, range))
         {
+            var changed = 0;
+            if (IsWpsDocument(document))
+            {
+                changed += NormalizeWpsTextStructureInPlace(document, range);
+                ResetWpsParagraphLayout(range);
+                ResetWpsTextStyle(range, settings);
+                changed += RemoveOuterMarkdownFenceInPlace(document, range);
+            }
+            changed += NormalizeMarkdownInPlace(document, range);
+            // 二次排版或混合文档中可能同时存在原生公式和仍未转换的 TeX。
+            // WPS 路径先修复旧版线性 OMath，再转换其余定界公式。
+            var previousScope = settings.ProcessingScope;
+            var previousAutoPaste = settings.AutoPaste;
+            var formulaCount = 0;
+            try
+            {
+                settings.ProcessingScope = "Document";
+                settings.AutoPaste = false;
+                formulaCount = NormalizeUnifiedAiFormulas(settings);
+            }
+            finally
+            {
+                settings.ProcessingScope = previousScope;
+                settings.AutoPaste = previousAutoPaste;
+            }
+            // 首次排版已在公式恢复前整理选项。二次排版时不再重写选项段，
+            // 避免把 WPS/Word 的 OMath 内部文本拆成真实段落。
             ApplyExamPaperStyle(document, paperSize, landscape, settings);
-            return 0;
+            FinishAiWebLayout(document);
+            return formulaCount;
         }
         var latexDocument = IsLatexDocumentSource(text);
         text = NormalizeWebAiFormulaText(text);
@@ -287,15 +325,16 @@ public sealed class OfficeDocumentService
         text = NormalizeLatexDocumentStructure(text);
         if (!latexDocument) text = NormalizeUnifiedAiStructure(text);
         text = NormalizeExamPaperSource(text);
+        if (IsWpsDocument(document)) text = NormalizeWpsParagraphMarks(text);
         var pendingFormulas = ProtectAiFormulas(ref text);
         var start = (int)range.Start;
         range.Text = text;
         range = document.Range(start, (int)range.End);
-        RenderMarkdownRangeAsWeb(document, range, true);
+        range = RenderMarkdownRangeAsWeb(document, range, true, settings);
         PrepareExamChoiceParagraphs(document, settings.ChoiceColumns);
         var count = RestoreProtectedFormulas(document, pendingFormulas);
-        FinishAiWebLayout(document);
         ApplyExamPaperStyle(document, paperSize, landscape, settings);
+        FinishAiWebLayout(document);
         return count;
     }
 
@@ -350,12 +389,20 @@ public sealed class OfficeDocumentService
         if (settings == null) settings = NormalizationSettings.Load();
         dynamic document = ((dynamic)_application).ActiveDocument;
         dynamic range = GetAiWorkingRange(document, settings.AutoPaste, settings.ProcessingScope);
+        var isWps = IsWpsDocument(document);
+        var cleaned = 0;
+        if (isWps)
+        {
+            try { cleaned = RemoveEmptyOfficeMath(document, (int)range.Start, (int)range.End); }
+            catch { }
+        }
         var repaired = RepairExistingOfficeMath(document, range);
         var text = (string)range.Text;
-        if (String.IsNullOrWhiteSpace((text ?? String.Empty).Trim('\r', '\a'))) return 0;
-        if (!RangeContainsOfficeMath(range))
+        if (String.IsNullOrWhiteSpace((text ?? String.Empty).Trim('\r', '\a'))) return cleaned;
+        if (!RangeContainsOfficeMath(document, range))
         {
             var normalizedText = NormalizeWebAiFormulaText(text);
+            if (IsWpsDocument(document)) normalizedText = NormalizeWpsParagraphMarks(normalizedText);
             if (!String.Equals(text, normalizedText, StringComparison.Ordinal))
             {
                 var normalizedStart = (int)range.Start;
@@ -371,7 +418,7 @@ public sealed class OfficeDocumentService
             .Where(match => !occupiedMath.Any(span => rangeStart + match.Index < span.Item2 &&
                                                      rangeStart + match.Index + match.Length > span.Item1))
             .ToList();
-        if (matches.Count == 0) return repaired;
+        if (matches.Count == 0) return repaired + cleaned;
         var previousScreenUpdating = true;
         var previousPagination = true;
         var selectionStart = -1;
@@ -380,8 +427,9 @@ public sealed class OfficeDocumentService
         {
             try { selectionStart = (int)document.Application.Selection.Start; selectionEnd = (int)document.Application.Selection.End; } catch { }
             try { previousScreenUpdating = (bool)document.Application.ScreenUpdating; document.Application.ScreenUpdating = false; } catch { }
-            try { previousPagination = (bool)document.Application.Options.Pagination; document.Application.Options.Pagination = false; } catch { }
-            var count = repaired;
+            if (!isWps)
+                try { previousPagination = (bool)document.Application.Options.Pagination; document.Application.Options.Pagination = false; } catch { }
+            var count = repaired + cleaned;
             foreach (var match in matches.OrderByDescending(item => item.Index))
             {
                 var formula = match.Formula.Trim();
@@ -389,12 +437,18 @@ public sealed class OfficeDocumentService
                 if (ReplaceWithOfficeMath(document, rangeStart + match.Index, match.Length,
                     match.Display ? WrapLongFormulaForDisplay(formula) : formula, match.Display)) count++;
             }
+            if (isWps)
+            {
+                try { count += RemoveEmptyOfficeMath(document, (int)range.Start, (int)range.End); }
+                catch { }
+            }
             FinishAiWebLayout(document, (int)range.Start, (int)range.End);
             return count;
         }
         finally
         {
-            try { document.Application.Options.Pagination = previousPagination; } catch { }
+            if (!isWps)
+                try { document.Application.Options.Pagination = previousPagination; } catch { }
             try { document.Application.ScreenUpdating = previousScreenUpdating; } catch { }
             if (String.Equals(settings.ProcessingScope, "Selection", StringComparison.OrdinalIgnoreCase))
             {
@@ -412,9 +466,14 @@ public sealed class OfficeDocumentService
         }
     }
 
-    private static bool RangeContainsOfficeMath(dynamic range)
+    private static bool RangeContainsOfficeMath(dynamic document, dynamic range)
     {
-        try { return (int)range.OMaths.Count > 0; }
+        try { if ((int)range.OMaths.Count > 0) return true; }
+        catch { }
+        try
+        {
+            return GetOfficeMathSpans(document, (int)range.Start, (int)range.End).Count > 0;
+        }
         catch { return false; }
     }
 
@@ -445,22 +504,81 @@ public sealed class OfficeDocumentService
     private static int RepairExistingOfficeMath(dynamic document, dynamic workingRange)
     {
         var repaired = 0;
+        var isWps = IsWpsDocument(document);
         var start = 0;
         var end = 0;
         try { start = (int)workingRange.Start; end = (int)workingRange.End; }
         catch { return 0; }
         var mathCount = SafeCollectionCount(document.OMaths);
+
+        if (isWps)
+        {
+            // 先完整快照候选，再按文档坐标倒序重建。WPS 在每次 FormattedText
+            // 赋值后都会重排 OMaths 集合；边改边按索引读取会跳项，甚至把下一
+            // 个公式的局部文本当成当前公式。
+            var candidates = new List<Tuple<int, int, string, bool>>();
+            for (var index = 1; index <= mathCount; index++)
+            {
+                try
+                {
+                    dynamic math = document.OMaths[index];
+                    if (!MathRangesOverlap(math, start, end) || HasStructuredOfficeMathXml(math)) continue;
+                    var visible = StripOfficeMathPlaceholderPrefix(
+                        Convert.ToString(math.Range.Text) ?? String.Empty);
+                    if (String.IsNullOrWhiteSpace(visible)) continue;
+                    if (!HasUnbuiltOfficeMathSyntax(visible) &&
+                        !RequiresStructuredOfficeMath(visible) &&
+                        !HasUnmatchedClosingParenthesis(visible)) continue;
+                    var mathStart = (int)math.Range.Start;
+                    var mathEnd = (int)math.Range.End;
+                    var center = false;
+                    try { center = (int)math.Range.ParagraphFormat.Alignment == 1; } catch { }
+                    candidates.Add(Tuple.Create(mathStart, Math.Max(1, mathEnd - mathStart), visible, center));
+                }
+                catch { }
+            }
+            foreach (var candidate in candidates.OrderByDescending(item => item.Item1))
+            {
+                try
+                {
+                    var latex = OmmlToLatexConverter.ConvertLinear(candidate.Item3);
+                    if (String.IsNullOrWhiteSpace(latex)) latex = NormalizeLatexInput(candidate.Item3);
+                    // FormattedText 直接覆盖 WPS 的旧线性 OMath 时，WPS 会保留旧对象外壳，
+                    // 随后的专业结构校验失败并回滚成普通文本。先以已去除占位提示的
+                    // 可见表达式替换整个旧对象，再把这段普通文本替换成 OMML。
+                    var replacementLength = candidate.Item2;
+                    try
+                    {
+                        dynamic legacyRange = document.Range(candidate.Item1,
+                            candidate.Item1 + candidate.Item2);
+                        legacyRange.Text = candidate.Item3;
+                        replacementLength = candidate.Item3.Length;
+                    }
+                    catch { }
+                    if (TryReplaceWithWpsOmml(document, candidate.Item1, replacementLength,
+                        latex, candidate.Item4)) repaired++;
+                }
+                catch { }
+            }
+            return repaired;
+        }
+
         for (var index = mathCount; index >= 1; index--)
         {
             dynamic math;
             try { math = document.OMaths[index]; } catch { continue; }
             if (!MathRangesOverlap(math, start, end)) continue;
+            // 已经含有分式、上下标、根式、矩阵等专业 OMML 结构时保持原样。
+            // WPS 的 Range.Text 有时仍以 e^x 形式暴露专业公式，不能仅凭可见
+            // 文本再次 Linearize/重建，否则二次规范会破坏幂等性。
+            if (HasStructuredOfficeMathXml(math)) continue;
             string visible;
             try { visible = math.Range.Text as string ?? String.Empty; } catch { continue; }
-            if (!Regex.IsMatch(visible,
-                    @"\\(?:dfrac|tfrac|frac|Biggl|Biggr|biggl|biggr|Biggm|biggm|Bigl|Bigr|bigl|bigr|Bigm|bigm|Bigg|bigg|Big|big|mleft|mright|left|right|middle|ln|log|sin|cos|tan)(?=\b|\d|\{|\s|\()") &&
+            if (!HasUnbuiltOfficeMathSyntax(visible) &&
+                !RequiresStructuredOfficeMath(visible) &&
                 !HasUnmatchedClosingParenthesis(visible)) continue;
             var original = visible;
+
             try
             {
                 try { math.Linearize(); } catch { }
@@ -478,10 +596,22 @@ public sealed class OfficeDocumentService
             }
             catch
             {
-                try { math.Range.Text = original; TryBuildMath(math); } catch { }
+                try
+                {
+                    math.Range.Text = original;
+                    TryBuildMath(math);
+                }
+                catch { }
             }
         }
         return repaired;
+    }
+
+    private static string StripOfficeMathPlaceholderPrefix(string source)
+    {
+        return Regex.Replace(source ?? String.Empty,
+            @"^\s*(?:(?:在此处键入公式|Type equation here)\s*[。.．]?\s*)",
+            String.Empty, RegexOptions.IgnoreCase);
     }
 
     public IList<FormulaPreviewItem> GetFormulaPreview(NormalizationSettings settings)
@@ -599,8 +729,9 @@ public sealed class OfficeDocumentService
                 dynamic section;
                 try { section = document.Sections[sectionIndex]; } catch { continue; }
                 dynamic setup = section.PageSetup;
-                try { setup.TextColumns.SetCount(landscape ? 2 : 1); } catch { }
-                try { setup.TextColumns.Spacing = 26f; } catch { }
+                // WPS 会以调用 SetCount 时的可用页宽缓存分栏宽度。必须先完成
+                // 纸张、方向和页边距设置，再创建分栏，否则 A3 横向会沿用旧的
+                // A4 栏宽，造成栏间距异常和大段留白。
                 try { setup.Orientation = landscape ? 1 : 0; } catch { }
                 try { setup.PaperSize = paperSize == 7 ? 7 : 6; } catch { }
                 try
@@ -618,25 +749,39 @@ public sealed class OfficeDocumentService
                 try { setup.RightMargin = margin; } catch { }
                 try { setup.HeaderDistance = 18f; } catch { }
                 try { setup.FooterDistance = 18f; } catch { }
+                try { setup.TextColumns.SetCount(landscape ? 2 : 1); } catch { }
+                try { setup.TextColumns.EvenlySpaced = -1; } catch { }
+                try { setup.TextColumns.Spacing = 26f; } catch { }
             }
         }
         catch { }
 
-        try
+        dynamic whole = null;
+        try { whole = document.Content; } catch { }
+        if (whole != null)
         {
-            dynamic whole = document.Content;
-            whole.Font.NameFarEast = settings.FontName;
-            whole.Font.Name = "Times New Roman";
-            whole.Font.Size = settings.FontSize;
-            whole.Font.Color = 0;
-            whole.ParagraphFormat.LineSpacingRule = 0;
-            whole.ParagraphFormat.SpaceAfter = settings.ParagraphSpaceAfter;
+            // WPS 的部分 Font/ParagraphFormat 属性在特定兼容模式下会单独
+            // 抛错。逐项设置可保证某一项失败时，正文取消加粗和缩进复位仍执行。
+            try { whole.Font.Bold = 0; } catch { }
+            try { whole.Font.Italic = 0; } catch { }
+            try { whole.Font.Underline = 0; } catch { }
+            try { whole.Font.Color = 0; } catch { }
+            try { whole.Font.NameFarEast = settings.FontName; } catch { }
+            try { whole.Font.Name = "Times New Roman"; } catch { }
+            try { whole.Font.Size = settings.FontSize; } catch { }
+            try { whole.ParagraphFormat.Alignment = 0; } catch { }
+            try { whole.ParagraphFormat.LeftIndent = 0f; } catch { }
+            try { whole.ParagraphFormat.RightIndent = 0f; } catch { }
+            try { whole.ParagraphFormat.FirstLineIndent = 0f; } catch { }
+            try { whole.ParagraphFormat.SpaceBefore = 0f; } catch { }
+            try { whole.ParagraphFormat.LineSpacingRule = 0; } catch { }
+            try { whole.ParagraphFormat.SpaceAfter = settings.ParagraphSpaceAfter; } catch { }
         }
-        catch { }
 
         try
         {
             var paragraphCount = SafeCollectionCount(document.Paragraphs);
+            var titleAssigned = false;
             for (var paragraphIndex = 1; paragraphIndex <= paragraphCount; paragraphIndex++)
             {
                 dynamic paragraph;
@@ -645,12 +790,27 @@ public sealed class OfficeDocumentService
                 var raw = range.Text as string ?? String.Empty;
                 var value = raw.Trim('\r', '\a', ' ', '\t');
                 if (value.Length == 0) continue;
-                range.ParagraphFormat.KeepTogether = -1;
+                // 不对所有正文强制“段中不分页”。WPS 会把较长的解析或评分
+                // 标准整段推到下一栏，左栏因此出现大片空白。只让标题与下一段
+                // 同栏，正文允许在页栏边界自然续排。
+                range.ParagraphFormat.KeepTogether = 0;
+                range.ParagraphFormat.KeepWithNext = 0;
+                range.ParagraphFormat.PageBreakBefore = 0;
                 range.ParagraphFormat.WidowControl = -1;
 
-                if ((value.Contains("普通高等学校招生全国统一考试") && value.Contains("试卷")) ||
-                    (value.Contains("高考") && value.Contains("数学")))
+                var likelyTitle = (value.Contains("普通高等学校招生全国统一考试") && value.Contains("试卷")) ||
+                                  (value.Contains("高考") && value.Contains("数学")) ||
+                                  (!titleAssigned && value.Length <= 90 &&
+                                   !value.StartsWith("绝密", StringComparison.Ordinal) &&
+                                   !value.StartsWith("本试卷", StringComparison.Ordinal) &&
+                                   !value.StartsWith("注意事项", StringComparison.Ordinal) &&
+                                   !value.StartsWith("第一部分", StringComparison.Ordinal) &&
+                                   !value.StartsWith("第二部分", StringComparison.Ordinal) &&
+                                   value != "参考答案" && value != "答案" && value != "评分标准" &&
+                                   !Regex.IsMatch(value, @"^(?:\d+[\.．、]|[一二三四五六七八九十]+[、．.])\s*"));
+                if (likelyTitle)
                 {
+                    titleAssigned = true;
                     var secondLine = value.IndexOf("数学（", StringComparison.Ordinal);
                     if (secondLine > 0) document.Range((int)range.Start + secondLine, (int)range.Start + secondLine).InsertBefore("\v");
                     range.ParagraphFormat.Alignment = 1;
@@ -666,7 +826,8 @@ public sealed class OfficeDocumentService
                     range.ParagraphFormat.SpaceAfter = 7f;
                     range.Font.Size = 10.5f;
                 }
-                else if (value == "注意事项" || value.StartsWith("第一部分", StringComparison.Ordinal) || value.StartsWith("第二部分", StringComparison.Ordinal))
+                else if (value == "注意事项" || value == "参考答案" || value == "答案" || value == "评分标准" ||
+                         value.StartsWith("第一部分", StringComparison.Ordinal) || value.StartsWith("第二部分", StringComparison.Ordinal))
                 {
                     range.Font.NameFarEast = "黑体";
                     range.Font.Bold = 1;
@@ -754,7 +915,9 @@ public sealed class OfficeDocumentService
         try
         {
             var paragraphCount = SafeCollectionCount(document.Paragraphs);
-            for (var paragraphIndex = 1; paragraphIndex <= paragraphCount; paragraphIndex++)
+            // 选项写回时可能把一段拆成两段；倒序处理可避免 WPS 的段落集合
+            // 即时重排后跳过后续题目。
+            for (var paragraphIndex = paragraphCount; paragraphIndex >= 1; paragraphIndex--)
             {
                 dynamic paragraph;
                 try { paragraph = document.Paragraphs[paragraphIndex]; } catch { continue; }
@@ -762,6 +925,10 @@ public sealed class OfficeDocumentService
                 var raw = range.Text as string ?? String.Empty;
                 var body = raw.TrimEnd('\r', '\a');
                 if (!Regex.IsMatch(body, @"^\s*A[\.．、]\s*") || !Regex.IsMatch(body, @"\s+B[\.．、]\s*")) continue;
+                // 整段回写 Range.Text 会把 WPS 中的内联 OMath 拆成普通字符，
+                // 二次排版时还会造成段落数暴涨。含公式的选项保持原结构；
+                // 其余纯文本选项再做列布局整理。
+                if (RangeContainsOfficeMath(document, range)) continue;
                 body = Regex.Replace(body, @"[ \t\u3000]+(?=[BCD][\.．、]\s*)", "\t");
                 if (columns <= 1) body = Regex.Replace(body, @"\t(?=[BCD][\.．、]\s*)", "\r");
                 else if (columns == 2) body = Regex.Replace(body, @"\t(?=C[\.．、]\s*)", "\r");
@@ -776,7 +943,14 @@ public sealed class OfficeDocumentService
     private static bool HasTextNormalizationMarkers(string text)
     {
         var value = text ?? String.Empty;
-        if (Regex.IsMatch(value, @"(?m)^\s{0,3}(?:#{1,6}\s+|```|~~~|[-+*]\s+|\d+[\.、]\s+|>\s+|\|.*\|\s*$)")) return true;
+        if (Regex.IsMatch(value, @"(?m)^[ \t]{0,3}(?:#{1,6}[ \t]+|```|~~~|[-+*][ \t]+|\d+[\.、][ \t]+|>[ \t]+|\|.*\|[ \t]*$)")) return true;
+        // WPS/网页复制经常把换行保存成手动换行或 Unicode 行分隔符，
+        // 这时 Markdown 标题不在 RegexOptions.Multiline 认可的行首。
+        // 仅把真正的 Markdown 标题当作结构标记。像 C# 教程、F# 代码这类
+        // “字母 + #” 普通文本不应触发全文规范；网页压平后的“正文 ## 标题”
+        // 仍可通过前面的空白或标点识别。
+        if (Regex.IsMatch(value,
+            @"(?:\A|(?<=[\r\n\v\f\u0085\u2028\u2029])|(?<=[^\p{L}\p{N}\\#]))#{1,6}[ \t]+\S")) return true;
         if (Regex.IsMatch(value, @"(?is)<(?:h[1-6]|p|table|ul|ol|li|blockquote)\b")) return true;
         return Regex.IsMatch(value, @"\\(?:documentclass|usepackage|geometry|begin\{document\}|(?:subsubsection|subsection|section)\*?\{|begin\{(?:enumerate|itemize|description|tabular|tabularx|longtable|theorem|lemma|definition|proof)\})");
     }
@@ -960,8 +1134,9 @@ public sealed class OfficeDocumentService
 
     private static string NormalizeUnifiedAiStructure(string text)
     {
-        var value = text ?? String.Empty;
-        value = Regex.Replace(value, @"(?<![#\r\n])(?=#{1,6}\s*)", "\r\r");
+        var value = NormalizeLogicalParagraphMarks(text);
+        value = SplitInlineMarkdownHeadings(value);
+        value = SplitFlattenedMarkdownHeadingBodies(value);
         value = Regex.Replace(value, @"(?:\A|(?<=[\r\n]))\s*公式[：:]\s*", String.Empty);
         value = Regex.Replace(value, @"(?<=[^\r\n])(?<!# )(?<!## )(?<!### )(?=[一二三四五六七八九十百]{1,3}、)", "\r\r");
         value = Regex.Replace(value, @"(?:\A|(?<=[\r\n]))(?<head>[一二三四五六七八九十百]{1,3}、[^\r\n]{1,28}?（[^）\r\n]{1,28}）)(?=\S)", "${head}\r");
@@ -974,7 +1149,85 @@ public sealed class OfficeDocumentService
         value = Regex.Replace(value, @"(?:\A|(?<=[\r\n]))(?<sub>(?:积化和差|和差化积|正弦定理|余弦定理|三角形面积))(?=\\\()", "### ${sub}\r");
         value = Regex.Replace(value, @"(?:\A|(?<=[\r\n]))(?<number>\d+[\.．、])\s*", "### ${number} ");
         value = Regex.Replace(value, @"(?:\A|(?<=[\r\n]))(?!##\s)(?<section>[一二三四五六七八九十百]{1,3}、[^\r\n]+)(?=\r|\n|\z)", "## ${section}");
+        value = Regex.Replace(value, @"[ \t\u00A0\u202F\u3000]+(?=\r)", String.Empty);
+        value = Regex.Replace(value, @"\r[ \t\u00A0\u202F\u3000]+(?=\r)", "\r");
+        value = Regex.Replace(value, @"\r{3,}", "\r\r");
         return value.TrimStart('\r', '\n');
+    }
+
+    private static string NormalizeLogicalParagraphMarks(string source)
+    {
+        return (source ?? String.Empty)
+            .Replace("\r\n", "\n")
+            .Replace('\r', '\n')
+            .Replace('\v', '\n')
+            .Replace('\f', '\n')
+            .Replace('\u0085', '\n')
+            .Replace('\u2028', '\n')
+            .Replace('\u2029', '\n')
+            .Replace('\n', '\r');
+    }
+
+    private static string SplitInlineMarkdownHeadings(string source)
+    {
+        // 保留一个前导字符后再插入段落标记，可避开 TeX 的 \\#，也不会
+        // 给已经位于段首的标题重复添加空段。
+        return Regex.Replace(source ?? String.Empty,
+            @"(?<prefix>[^\r\\#\p{L}\p{N}])(?<heading>#{1,6}[ \t]+\S)",
+            "${prefix}\r${heading}");
+    }
+
+    private static string SplitFlattenedMarkdownHeadingBodies(string source)
+    {
+        var paragraphs = (source ?? String.Empty).Split(new[] { '\r' }, StringSplitOptions.None);
+        var output = new List<string>(paragraphs.Length + 8);
+        foreach (var paragraph in paragraphs)
+        {
+            var match = Regex.Match(paragraph,
+                @"^(?<prefix>[ \t]*)(?<marks>#{1,6})[ \t]+(?<body>.*)$");
+            if (!match.Success)
+            {
+                output.Add(paragraph);
+                continue;
+            }
+
+            var body = match.Groups["body"].Value;
+            var marks = match.Groups["marks"].Value;
+            var boundary = -1;
+            if (marks.Length <= 2)
+            {
+                // 标题后紧接题号、试卷说明或下一层分节时，恢复缺失的换行。
+                var bodyStart = Regex.Match(body,
+                    @"(?<!^)[ \t]+(?=(?:绝密(?:★\S*)?|本试卷|注意事项|第[一二三四五六七八九十百]+部分|[一二三四五六七八九十百]{1,3}[、．.]|\d{1,3}[\.．、][ \t]*(?:已知|设|若|函数|执行|在|下列|给定|判断|求|证明)|[（(]\d+[)）]))");
+                if (bodyStart.Success) boundary = bodyStart.Index;
+                if (boundary < 0 && Regex.IsMatch(body,
+                    @"^(?:[（(]\d+[)）][ \t]*)?.{0,40}(?:讨论|证明|分析|解答|步骤|方法|结论|评分|答案|解析|定义|公式|定理|求解过程|题意翻译|核心公式|核心关键|恒成立|单调性|不等式|变形|换元)"))
+                {
+                    bodyStart = Regex.Match(body,
+                        @"(?<!^)[ \t]+(?=(?:函数|当|若|设|已知|需证|证明|求导|构造|令|由|先证|代入|因此|于是|可得|根据|综上|对任意|条件|等价于|五倍角公式|和差化积|原表达式|核心关键|题意|考虑|利用))");
+                    if (bodyStart.Success) boundary = bodyStart.Index;
+                }
+            }
+            else if (Regex.IsMatch(body,
+                @"^(?:[（(]\d+[)）][ \t]*)?.{0,40}(?:讨论|证明|分析|解答|步骤|方法|结论|评分|答案|解析|定义|公式|定理|求解过程|题意翻译|核心公式|核心关键|恒成立|单调性|不等式|变形|换元)"))
+            {
+                var bodyStart = Regex.Match(body,
+                    @"(?<!^)[ \t]+(?=(?:函数|当|若|设|已知|需证|证明|求导|构造|令|由|先证|代入|因此|于是|可得|根据|综上|对任意|条件|等价于|五倍角公式|和差化积|原表达式|核心关键|题意|考虑|利用))");
+                if (bodyStart.Success) boundary = bodyStart.Index;
+            }
+
+            if (boundary <= 0)
+            {
+                output.Add(paragraph);
+                continue;
+            }
+
+            var headingText = body.Substring(0, boundary).TrimEnd();
+            var followingText = body.Substring(boundary).TrimStart();
+            output.Add(match.Groups["prefix"].Value + marks + " " + headingText);
+            if (followingText.Length > 0) output.Add(followingText);
+        }
+        return String.Join("\r", output);
     }
 
     private dynamic GetAiWorkingRange(dynamic document, bool autoPaste, string scope)
@@ -1294,7 +1547,7 @@ public sealed class OfficeDocumentService
         dynamic target = !String.IsNullOrWhiteSpace((selectedText ?? String.Empty).Trim('\r', '\a')) ? selected : document.Content;
         var text = target.Text as string ?? String.Empty;
         if (String.IsNullOrWhiteSpace(text.Trim('\r', '\a'))) return 0;
-        RenderMarkdownRangeAsWeb(document, target, preserveHeadings);
+        RenderMarkdownRangeAsWeb(document, target, preserveHeadings, NormalizationSettings.Load());
         var formulas = ConvertLatexToOfficeMath();
         FinishAiWebLayout(document, (int)target.Start, (int)target.End);
         return formulas + 1;
@@ -1385,9 +1638,27 @@ public sealed class OfficeDocumentService
         return Regex.Replace(result.ToString(), @"\s+", " ").Trim();
     }
 
-    private static dynamic RenderMarkdownRangeAsWeb(dynamic document, dynamic sourceRange, bool preserveHeadings)
+    private static dynamic RenderMarkdownRangeAsWeb(dynamic document, dynamic sourceRange, bool preserveHeadings, NormalizationSettings settings = null)
     {
         var source = sourceRange.Text as string ?? String.Empty;
+        if (IsWpsDocument(document))
+        {
+            // WPS 的 HTML InsertFile 会把 CSS 分页属性、空段和旧页宽一起导入，
+            // 表面上看似写入成功，随后却会出现整页空白、栏宽错乱或正文乱序。
+            // WPS 直接保留纯文本结构并在原位置设置段落样式，公式标记也不会
+            // 在 HTML 往返中被转义。
+            var start = (int)sourceRange.Start;
+            if (!RangeContainsOfficeMath(document, sourceRange))
+            {
+                var normalized = NormalizeWpsParagraphMarks(NormalizeWebAiFormulaText(source));
+                if (!String.Equals(source, normalized, StringComparison.Ordinal)) sourceRange.Text = normalized;
+            }
+            dynamic formatted = document.Range(start, (int)sourceRange.End);
+            ResetWpsParagraphLayout(formatted);
+            ResetWpsTextStyle(formatted, settings ?? NormalizationSettings.Load());
+            NormalizeMarkdownInPlace(document, formatted, preserveHeadings);
+            return document.Range(start, (int)formatted.End);
+        }
         var html = AiWebFormatter.ToHtml(source, preserveHeadings);
         var tempPath = Path.Combine(Path.GetTempPath(), "ai-word-layout-" + Guid.NewGuid().ToString("N") + ".html");
         File.WriteAllText(tempPath, html, new UTF8Encoding(true));
@@ -1430,7 +1701,7 @@ public sealed class OfficeDocumentService
 
     private static dynamic ApplyPlainMarkdownFormatting(dynamic document, dynamic sourceRange)
     {
-        if (RangeContainsOfficeMath(sourceRange))
+        if (RangeContainsOfficeMath(document, sourceRange))
         {
             NormalizeMarkdownInPlace(document, sourceRange);
             return sourceRange;
@@ -1477,7 +1748,7 @@ public sealed class OfficeDocumentService
         return formatted;
     }
 
-    private static int NormalizeMarkdownInPlace(dynamic document, dynamic sourceRange)
+    private static int NormalizeMarkdownInPlace(dynamic document, dynamic sourceRange, bool preserveHeadings = true)
     {
         var changed = 0;
         var paragraphCount = SafeCollectionCount(sourceRange.Paragraphs);
@@ -1509,21 +1780,44 @@ public sealed class OfficeDocumentService
             changed += FormatInlineMarkdownMarkers(document, paragraphRange, body);
             raw = paragraphRange.Text as string ?? String.Empty;
             body = raw.TrimEnd('\r', '\a');
-            var heading = Regex.Match(body, @"^(?<prefix>\s*#{1,6}\s+)(?<text>.+)$");
+            var heading = Regex.Match(body, @"^(?<prefix>\s*#{1,6}[ \t]*)(?<text>\S.*)$");
             if (heading.Success)
             {
                 try
                 {
                     var marks = Regex.Match(heading.Groups["prefix"].Value, @"#{1,6}").Value.Length;
                     var start = (int)paragraphRange.Start;
+                    var headingBody = heading.Groups["text"].Value;
                     document.Range(start, start + heading.Groups["prefix"].Length).Delete();
                     dynamic updated = document.Range(start, start).Paragraphs[1].Range;
-                    updated.Font.Bold = 1;
-                    updated.Font.NameFarEast = "微软雅黑";
-                    updated.Font.Size = Math.Max(12f, 19f - marks * 1.5f);
-                    updated.ParagraphFormat.SpaceBefore = 6f;
-                    updated.ParagraphFormat.SpaceAfter = 4f;
-                    updated.ParagraphFormat.KeepWithNext = -1;
+                    if (preserveHeadings)
+                    {
+                        var styleLength = headingBody.Length;
+                        var bodyStart = Regex.Match(headingBody,
+                            @"(?<!^)[ \t]+(?=(?:函数|当|若|设|已知|需证|证明|求导|构造|令|由|先证|代入|因此|于是|可得|根据|综上|对任意|条件|等价于|五倍角公式|和差化积|原表达式|核心关键|题意|考虑|利用))");
+                        if (bodyStart.Success) styleLength = bodyStart.Index;
+                        else if (styleLength > 90)
+                        {
+                            var sentence = Regex.Match(headingBody, @"[。；！？](?=\s|\S)");
+                            styleLength = sentence.Success && sentence.Index >= 8
+                                ? sentence.Index + sentence.Length
+                                : Math.Min(48, styleLength);
+                        }
+                        dynamic headingRange = updated;
+                        try
+                        {
+                            var available = Math.Max(0, (int)updated.End - start - 1);
+                            if (styleLength > 0 && styleLength < available)
+                                headingRange = document.Range(start, start + Math.Min(styleLength, available));
+                        }
+                        catch { }
+                        headingRange.Font.Bold = 1;
+                        headingRange.Font.NameFarEast = "微软雅黑";
+                        headingRange.Font.Size = Math.Max(12f, 19f - marks * 1.5f);
+                        updated.ParagraphFormat.SpaceBefore = 6f;
+                        updated.ParagraphFormat.SpaceAfter = 4f;
+                        updated.ParagraphFormat.KeepWithNext = -1;
+                    }
                     changed++;
                 }
                 catch { }
@@ -1555,6 +1849,123 @@ public sealed class OfficeDocumentService
             }
         }
         return changed;
+    }
+
+    private static int RemoveOuterMarkdownFenceInPlace(dynamic document, dynamic sourceRange)
+    {
+        try
+        {
+            var count = SafeCollectionCount(sourceRange.Paragraphs);
+            var firstIndex = 0;
+            var lastIndex = 0;
+            for (var index = 1; index <= count; index++)
+            {
+                var value = Convert.ToString(sourceRange.Paragraphs[index].Range.Text)
+                    .Trim('\r', '\n', '\a', ' ', '\t');
+                if (value.Length == 0) continue;
+                if (firstIndex == 0) firstIndex = index;
+                lastIndex = index;
+            }
+            if (firstIndex == 0 || lastIndex <= firstIndex) return 0;
+            dynamic first = sourceRange.Paragraphs[firstIndex].Range;
+            dynamic last = sourceRange.Paragraphs[lastIndex].Range;
+            var firstText = Convert.ToString(first.Text).Trim('\r', '\n', '\a', ' ', '\t');
+            var lastText = Convert.ToString(last.Text).Trim('\r', '\n', '\a', ' ', '\t');
+            var opening = Regex.Match(firstText, @"^(?<fence>`{3,}|~{3,})(?:text|plaintext|markdown|md)?\s*$", RegexOptions.IgnoreCase);
+            if (!opening.Success) return 0;
+            var marker = opening.Groups["fence"].Value;
+            if (!Regex.IsMatch(lastText, @"^" + Regex.Escape(marker.Substring(0, 1)) + "{" + marker.Length + @",}\s*$")) return 0;
+
+            var lastStart = (int)last.Start;
+            var lastEnd = (int)last.End;
+            document.Range(lastStart, lastEnd).Delete();
+            var firstStart = (int)first.Start;
+            var firstEnd = (int)first.End;
+            document.Range(firstStart, firstEnd).Delete();
+            return 2;
+        }
+        catch { return 0; }
+    }
+
+    private static string NormalizeWpsParagraphMarks(string source)
+    {
+        // WPS 的 Range.Text 只把 CR 当作段落标记。网页复制还可能带入
+        // VT/FF/NEL/Unicode 行分隔符，统一后才会生成真正的 WPS 段落。
+        var value = NormalizeLogicalParagraphMarks(source);
+        value = SplitInlineMarkdownHeadings(value);
+        value = SplitFlattenedMarkdownHeadingBodies(value);
+        value = Regex.Replace(value, @"[ \t\u00A0\u202F\u3000]+(?=\r)", String.Empty);
+        value = Regex.Replace(value, @"\r[ \t\u00A0\u202F\u3000]+(?=\r)", "\r");
+        value = Regex.Replace(value, @"\r{3,}", "\r\r");
+        return value;
+    }
+
+    private static int NormalizeWpsTextStructureInPlace(dynamic document, dynamic range)
+    {
+        var changed = 0;
+        changed += ApplyRegexInRangePreservingMath((object)document, (object)range,
+            @"\r\n|[\n\v\f\u0085\u2028\u2029]", match => "\r");
+        changed += InsertParagraphsBeforeInlineHeadings(document, range);
+
+        // 处理被浏览器/WPS 压成一行的高置信度标题结构；只改标题周围的
+        // 小范围，已有 Office 公式对象不参与文本重写。
+        changed += ApplyRegexInRangePreservingMath((object)document, (object)range,
+            @"(?<heading>#{1,2}[ \t]+(?:解答题|选择题|填空题|参考答案|评分标准|答案|解析|注意事项|第[一二三四五六七八九十百]+部分)(?:[（(][^\r)）]{0,30}[)）])?)[ \t]+(?<body>(?:\d+[\.．、]|[一二三四五六七八九十百]{1,3}[、．.]|[（(]\d+[)）]|绝密|本试卷)[ \t]*)",
+            match => match.Groups["heading"].Value + "\r" + match.Groups["body"].Value);
+        changed += ApplyRegexInRangePreservingMath((object)document, (object)range,
+            @"(?<heading>#{3,6}[ \t]+(?:[（(]\d+[)）][ \t]*)?[^\r]{1,40}?(?:讨论|证明|分析|解答|步骤|方法|结论|评分|答案|解析|定义|公式|定理|求解过程|题意翻译|核心公式|核心关键|恒成立|单调性|不等式|变形|换元))[ \t]+(?<body>(?:函数|当|若|设|已知|需证|证明|求导|构造|令|由|先证|代入|因此|于是|可得|根据|综上|对任意|条件|等价于|五倍角公式|和差化积|原表达式|核心关键|题意|考虑|利用)(?:[：:，,]|[ \t])?)",
+            match => match.Groups["heading"].Value + "\r" + match.Groups["body"].Value);
+        changed += ApplyRegexInRangePreservingMath((object)document, (object)range,
+            @"(?<heading>#{2,6}[ \t]+[^\r]{3,60}?)[ \t]+(?<body>(?:条件|等价于|五倍角公式|和差化积|原表达式|于是|核心关键|题意|考虑|利用)(?:[：:，,]|[ \t])?)",
+            match => match.Groups["heading"].Value.TrimEnd() + "\r" + match.Groups["body"].Value);
+        changed += InsertParagraphsBetweenMarkdownHeadingsAndMath(document, range);
+        changed += ApplyRegexInRangePreservingMath((object)document, (object)range,
+            @"[ \t\u00A0\u202F\u3000]+(?=\r)", match => String.Empty);
+        changed += ApplyRegexInRangePreservingMath((object)document, (object)range,
+            @"\r[ \t\u00A0\u202F\u3000]+(?=\r)", match => "\r");
+        changed += ApplyRegexInRangePreservingMath((object)document, (object)range,
+            @"\r{3,}", match => "\r\r");
+        return changed;
+    }
+
+    private static void ResetWpsParagraphLayout(dynamic range)
+    {
+        try
+        {
+            dynamic format = range.ParagraphFormat;
+            format.Alignment = 0;
+            format.LeftIndent = 0f;
+            format.RightIndent = 0f;
+            format.FirstLineIndent = 0f;
+            format.SpaceBefore = 0f;
+            format.SpaceAfter = 4f;
+            format.LineSpacingRule = 0;
+            format.KeepTogether = 0;
+            format.KeepWithNext = 0;
+            format.PageBreakBefore = 0;
+            format.WidowControl = -1;
+        }
+        catch { }
+    }
+
+    private static void ResetWpsTextStyle(dynamic range, NormalizationSettings settings)
+    {
+        try
+        {
+            if (settings == null) settings = NormalizationSettings.Load();
+            dynamic font = range.Font;
+            font.Bold = 0;
+            font.Italic = 0;
+            font.Underline = 0;
+            font.Color = 0;
+            font.Position = 0;
+            try { font.Spacing = 0f; } catch { }
+            try { font.Scaling = 100; } catch { }
+            font.NameFarEast = String.IsNullOrWhiteSpace(settings.FontName) ? "宋体" : settings.FontName;
+            font.Name = "Times New Roman";
+            font.Size = settings.FontSize > 0 ? settings.FontSize : 12f;
+        }
+        catch { }
     }
 
     private static int FormatInlineMarkdownMarkers(dynamic document, dynamic paragraphRange, string body)
@@ -2462,7 +2873,7 @@ public sealed class OfficeDocumentService
         // “同理 a<-\dfrac13\)。”。强 TeX 命令仍能可靠表明这是公式，
         // 因此只补捉包含这类命令的局部片段，不把整段普通文字改成公式。
         var strongCommands = Regex.Matches(source,
-            @"\\(?:dfrac|tfrac|cfrac|frac|sqrt|binom|sum|prod|coprod|bigcup|bigcap|int|iint|iiint|oint|oiint|lim|sin|cos|tan|cot|sec|csc|sinh|cosh|log|ln|exp|det|rank|ker|Pr|vec|overrightarrow|xrightarrow|xleftarrow|overline|widehat|mathbb|alpha|beta|gamma|delta|epsilon|varepsilon|theta|lambda|mu|pi|varphi|phi|triangle|emptyset|varnothing|underline|operatorname|lt|gt)(?=\b|\d|\{|\s)",
+            @"\\(?:eqarray|matrix|cases|dfrac|tfrac|cfrac|frac|sqrt|binom|sum|prod|coprod|bigcup|bigcap|int|iint|iiint|oint|oiint|lim|sin|cos|tan|cot|sec|csc|sinh|cosh|log|ln|exp|det|rank|ker|Pr|vec|overrightarrow|xrightarrow|xleftarrow|overline|widehat|mathbb|alpha|beta|gamma|delta|epsilon|varepsilon|theta|lambda|mu|pi|varphi|phi|triangle|emptyset|varnothing|underline|operatorname|lt|gt)(?=\b|\d|\{|\s|\()",
             RegexOptions.IgnoreCase);
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (Match command in strongCommands)
@@ -2566,7 +2977,7 @@ public sealed class OfficeDocumentService
         if (value == '\r' || value == '\n' || value == '\a') return false;
         if (value == ' ' || value == '\t') return allowSpace;
         if (value == '\\' || value == '_' || value == '^') return true;
-        if (value <= 127 && (Char.IsLetterOrDigit(value) || "{}()[]+-*/=<>,.|:;!%&~'".IndexOf(value) >= 0)) return true;
+        if (value <= 127 && (Char.IsLetterOrDigit(value) || "{}()[]+-*/=<>,.|:;!%&@~'".IndexOf(value) >= 0)) return true;
         return value >= '\u0370' && value <= '\u03ff' || value >= '\u2190' && value <= '\u22ff' ||
                value == '\u00b0' || value == '\u00b1' || value == '\u00d7' || value == '\u00f7' || value == '\u25b3';
     }
@@ -2654,7 +3065,15 @@ public sealed class OfficeDocumentService
 
     private static bool ReplaceWithOfficeMath(dynamic document, int start, int length, string latex, bool center)
     {
-        latex = NormalizeLatexInput((latex ?? String.Empty).Replace('\a', ' ').Replace('\v', ' '));
+        latex = StripOfficeMathPlaceholderPrefix(
+            (latex ?? String.Empty).Replace('\a', ' ').Replace('\v', ' '));
+        if (Regex.IsMatch(latex, @"\\(?:eqarray|matrix|cases)\s*\(", RegexOptions.IgnoreCase))
+        {
+            var legacyLatex = OmmlToLatexConverter.ConvertLinear(latex);
+            if (!String.IsNullOrWhiteSpace(legacyLatex)) latex = legacyLatex;
+        }
+        latex = NormalizeLatexInput(latex);
+        var isWps = IsWpsDocument(document);
         try
         {
             var documentStart = (int)document.Content.Start;
@@ -2664,7 +3083,14 @@ public sealed class OfficeDocumentService
             if (length == 0 || String.IsNullOrWhiteSpace(latex)) return false;
         }
         catch { return false; }
-        if (center && !IsWpsDocument(document))
+
+        // WPS 12.1 的 OMath.BuildUp/OMaths.BuildUp 会返回成功，但生成的仍是
+        // <m:r><m:t>e^x</m:t></m:r> 线性文字。直接把本项目生成的 OMML 放入
+        // 临时 DOCX，再在同一个 WPS.Application 中传递 FormattedText，才能
+        // 稳定得到真正的 sSup、f、rad、eqArr、matrix 等专业公式结构。
+        if (isWps && TryReplaceWithWpsOmml(document, start, length, latex, center)) return true;
+
+        if (center && !isWps)
         {
             var omml = OmmlMathBuilder.BuildEquationXml(latex);
             var fragmentPath = OmmlDocxFragment.Create(omml, true);
@@ -2755,58 +3181,123 @@ public sealed class OfficeDocumentService
             rowStart -= rows[index].Length;
             try
             {
-                dynamic mathRange = document.Range(rowStart, rowStart + rows[index].Length);
+                var rowEnd = rowStart + rows[index].Length;
+                dynamic mathRange = document.Range(rowStart, rowEnd);
+                var mathSource = Convert.ToString(mathRange.Text) ?? String.Empty;
+                if ((int)mathRange.End <= (int)mathRange.Start ||
+                    String.IsNullOrWhiteSpace(mathSource.Trim('\r', '\n', '\a', '\v', ' ', '\t')))
+                    continue;
                 // OMaths.Add returns a Word.Range.  BuildUp belongs to the OMath/OMaths
                 // inside that returned range; calling it on the Range silently left the
                 // equation in linear form (for example "(a+b)/(c)").
                 dynamic equationRange = null;
-                try { equationRange = document.OMaths.Add(mathRange); }
-                catch
+                dynamic selection = null;
+                var added = false;
+                if (isWps)
                 {
-                    // WPS 主要在 Selection.OMaths 上公开 Add；参考其原生调用
-                    // 顺序，选中当前小范围后再创建公式。
-                }
-                if (ResolveCreatedMath(document, equationRange, mathRange, rowStart, rowStart + rows[index].Length) == null)
-                {
-                    mathRange.Select();
-                    dynamic selection = document.Application.Selection;
-                    try { equationRange = selection.OMaths.Add(selection.Range); } catch { }
-                }
-                dynamic math = ResolveCreatedMath(document, equationRange, mathRange, rowStart, rowStart + rows[index].Length);
-                if (math != null)
-                {
-                    var built = TryBuildMath(math);
-                    if (!built)
+                    // WPS 对 OMaths.Count 和 Add 返回范围的刷新可能滞后。
+                    // 每个公式只执行一次 Add；否则第二次 Add 会在正确公式后
+                    // 生成灰色的“在此处键入公式。”空框。
+                    selection = document.Application.Selection;
+                    try { selection.SetRange(rowStart, rowEnd); }
+                    catch { mathRange.Select(); selection = document.Application.Selection; }
+                    try
                     {
+                        if ((int)selection.Start != rowStart || (int)selection.End != rowEnd)
+                            selection.SetRange(rowStart, rowEnd);
+                    }
+                    catch { }
+                    try { equationRange = selection.OMaths.Add(selection.Range); added = true; }
+                    catch { added = false; }
+                }
+                else
+                {
+                    try { equationRange = document.OMaths.Add(mathRange); added = true; }
+                    catch
+                    {
+                        // Word 的文档集合在受保护范围中偶尔拒绝 Add；只有首次
+                        // 调用明确抛错时才改用选区，避免重复创建公式对象。
                         try
                         {
                             mathRange.Select();
-                            dynamic selection = document.Application.Selection;
-                            try { selection.Range.OMaths.BuildUp(); built = true; }
-                            catch { try { selection.OMaths.BuildUp(); built = true; } catch { } }
-                            math = ResolveCreatedMath(document, equationRange, mathRange, rowStart, rowStart + rows[index].Length);
-                            built = built && math != null;
+                            selection = document.Application.Selection;
+                            equationRange = selection.OMaths.Add(selection.Range);
+                            added = true;
                         }
-                        catch { built = false; }
+                        catch { added = false; }
                     }
-                    if (built)
+                }
+                if (!added) continue;
+                dynamic math = ResolveCreatedMath(document, equationRange, mathRange, rowStart, rowEnd);
+                var buildRequested = false;
+                var built = false;
+                if (isWps)
+                {
+                    // WPS 的 Range.OMaths.BuildUp 在部分版本中会正常返回却不做
+                    // 任何转换。其原生调用顺序是：对非空选区 Add 一次，然后对
+                    // 新建 OMath 的 Parent（OMaths 集合）执行 BuildUp。这里每轮
+                    // 都先走 Parent，并逐一构建选区里的公式；绝不因某个无效果
+                    // 的 BuildUp 未抛异常就短路。
+                    for (var attempt = 0; attempt < 6; attempt++)
                     {
-                        try { math.Range.Font.Name = "Cambria Math"; } catch { }
-                        if (center || rows.Length > 1) try { math.Range.ParagraphFormat.Alignment = 1; } catch { }
-                        converted++;
+                        if (math != null) buildRequested |= TryBuildWpsMath(math);
+                        buildRequested |= TryBuildWpsMathsInHolder(equationRange);
+                        if (selection != null)
+                        {
+                            try { buildRequested |= TryBuildWpsMathsInHolder(selection.Range); } catch { }
+                            buildRequested |= TryBuildWpsMathsInHolder(selection);
+                        }
+
+                        math = ResolveCreatedMath(document, equationRange,
+                            document.Range(rowStart, Math.Min((int)document.Content.End, rowEnd + 2)),
+                            rowStart, rowEnd + 2);
+                        if (math != null && IsProfessionallyBuiltOfficeMath(math, rows[index]))
+                        {
+                            built = true;
+                            break;
+                        }
+                        if (attempt < 5) Thread.Sleep(20);
                     }
                 }
                 else
                 {
-                    // 某些 WPS 版本只在选区集合上公开 BuildUp。
-                    try
+                    buildRequested = math != null && TryBuildMath(math);
+                    if (!buildRequested)
                     {
-                        dynamic selection = document.Application.Selection;
-                        selection.Range.OMaths.BuildUp();
-                        math = ResolveCreatedMath(document, equationRange, mathRange, rowStart, rowStart + rows[index].Length);
-                        if (math != null) converted++;
+                        try
+                        {
+                            if (selection == null)
+                            {
+                                mathRange.Select();
+                                selection = document.Application.Selection;
+                            }
+                            buildRequested = TryBuildMathHolder(equationRange) ||
+                                             TryBuildMathHolder(selection.Range) ||
+                                             TryBuildMathHolder(selection);
+                        }
+                        catch { buildRequested = false; }
                     }
-                    catch { }
+                    math = ResolveCreatedMath(document, equationRange, mathRange, rowStart, rowEnd);
+                    built = buildRequested && math != null;
+                }
+
+                if (built)
+                {
+                    if (math != null)
+                    {
+                        try { math.Range.Font.Name = "Cambria Math"; } catch { }
+                        if (center || rows.Length > 1) try { math.Range.ParagraphFormat.Alignment = 1; } catch { }
+                    }
+                    if (isWps && selection != null)
+                    {
+                        try { selection.Collapse(0); } catch { }
+                        try { selection.MoveRight(1, 1); } catch { }
+                    }
+                    converted++;
+                }
+                else if (isWps)
+                {
+                    RemoveOfficeMathObjectsInRange(document, rowStart, rowEnd + 1, false);
                 }
             }
             catch { }
@@ -2818,13 +3309,150 @@ public sealed class OfficeDocumentService
             // 避免留下半公式、线性文本或下次运行时重复创建公式框。
             try
             {
-                var restoreEnd = Math.Min((int)document.Content.End, Math.Max((int)target.End, start + linear.Length));
-                document.Range(start, restoreEnd).Text = originalLinearSource;
+                if (isWps)
+                    RemoveOfficeMathObjectsInRange(document, start, start + linear.Length + 1, false);
+                target.Text = originalLinearSource;
             }
             catch { }
             return false;
         }
+        if (isWps)
+        {
+            try { RemoveEmptyOfficeMath(document, Math.Max(0, start - 1), start + Math.Max(length, linear.Length) + 4); }
+            catch { }
+        }
         return true;
+    }
+
+    private static bool TryReplaceWithWpsOmml(dynamic document, int start, int length, string latex, bool center)
+    {
+        var omml = OmmlMathBuilder.BuildEquationXml(latex);
+        if (String.IsNullOrWhiteSpace(omml)) return false;
+        var fragmentPath = OmmlDocxFragment.Create(omml, center);
+        if (String.IsNullOrWhiteSpace(fragmentPath)) return false;
+
+        dynamic sourceDocument = null;
+        dynamic target = null;
+        var original = String.Empty;
+        var changed = false;
+        try
+        {
+            target = document.Range(start, start + length);
+            original = Convert.ToString(target.Text) ?? String.Empty;
+
+            // 必须由当前 WPS 实例打开临时文档；跨 Application 的
+            // FormattedText 不能可靠保留 OMML。后四个参数分别为文件名、
+            // 确认转换、只读和最近文件。
+            sourceDocument = document.Application.Documents.Open(fragmentPath, false, true, false);
+            if (SafeCollectionCount(sourceDocument.OMaths) < 1) return false;
+            dynamic sourceMath = sourceDocument.OMaths.Item(1);
+            if (!IsProfessionallyBuiltOfficeMath(sourceMath, latex)) return false;
+            target.FormattedText = sourceMath.Range.FormattedText;
+            changed = true;
+
+            dynamic insertedMath = null;
+            for (var attempt = 0; attempt < 4; attempt++)
+            {
+                var targetEnd = Math.Max(start + 1, (int)target.End);
+                insertedMath = ResolveCreatedMath(document, target, target, start, targetEnd + 1);
+                if (insertedMath != null && IsProfessionallyBuiltOfficeMath(insertedMath, latex)) break;
+                insertedMath = null;
+                if (attempt < 3) Thread.Sleep(15);
+            }
+            if (insertedMath == null) throw new InvalidOperationException("WPS 未写入专业公式结构。");
+
+            try { insertedMath.Range.Font.Name = "Cambria Math"; } catch { }
+            if (center)
+            {
+                try { insertedMath.Range.ParagraphFormat.Alignment = 1; } catch { }
+                try { insertedMath.Justification = 2; } catch { }
+            }
+            return true;
+        }
+        catch
+        {
+            // FormattedText 传输一旦失败，恢复原始标记，后续线性兼容路径可
+            // 继续尝试；文档中不会留下空公式框或半转换的 OMML。
+            if (changed)
+            {
+                try { target.Text = original; }
+                catch
+                {
+                    try
+                    {
+                        var rollbackEnd = Math.Min((int)document.Content.End,
+                            Math.Max(start, start + Math.Max(1, length)));
+                        document.Range(start, rollbackEnd).Text = original;
+                    }
+                    catch { }
+                }
+            }
+            return false;
+        }
+        finally
+        {
+            if (sourceDocument != null)
+            {
+                try { sourceDocument.Close(0); } catch { }
+            }
+            try { File.Delete(fragmentPath); } catch { }
+            try { document.Activate(); } catch { }
+        }
+    }
+
+    private static int RemoveEmptyOfficeMath(dynamic document, int start, int end)
+    {
+        return RemoveOfficeMathObjectsInRange(document, start, end, true);
+    }
+
+    private static int RemoveOfficeMathObjectsInRange(dynamic document, int start, int end, bool onlyEmpty)
+    {
+        var removed = 0;
+        for (var index = SafeCollectionCount(document.OMaths); index >= 1; index--)
+        {
+            try
+            {
+                dynamic math = document.OMaths[index];
+                dynamic mathRange = math.Range;
+                var mathStart = (int)mathRange.Start;
+                var mathEnd = (int)mathRange.End;
+                // Range 使用半开区间 [start, end)。恰好从 end 开始的相邻公式
+                // 不属于当前范围，失败清理时也不应被连带删除。
+                var inScope = mathStart < end && mathEnd > start;
+                if (!inScope) continue;
+                if (onlyEmpty && IsSubstantiveOfficeMath(math)) continue;
+                try { mathRange.Delete(); }
+                catch
+                {
+                    mathRange.Select();
+                    document.Application.Selection.Delete();
+                }
+                removed++;
+            }
+            catch { }
+        }
+        return removed;
+    }
+
+    private static bool IsSubstantiveOfficeMath(dynamic math)
+    {
+        if (math == null) return false;
+        try
+        {
+            dynamic range = math.Range;
+            if ((int)range.End <= (int)range.Start) return false;
+            var raw = Convert.ToString(range.Text) ?? String.Empty;
+            var visible = Regex.Replace(raw,
+                "[\\r\\n\\a\\v\\u200B\\u200C\\u200D\\u2060\\uFEFF\\uFFFC]", String.Empty).Trim();
+            if (visible.Length == 0) return false;
+            // 只有整串都是占位提示时才视为空公式；“有效内容 + 提示”需要保留
+            // 给修复流程处理，不能把整个公式对象直接删除。
+            return !String.Equals(visible, "在此处键入公式。", StringComparison.OrdinalIgnoreCase) &&
+                   !String.Equals(visible, "在此处键入公式", StringComparison.OrdinalIgnoreCase) &&
+                   !String.Equals(visible, "Type equation here.", StringComparison.OrdinalIgnoreCase) &&
+                   !String.Equals(visible, "Type equation here", StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
     }
 
     private static dynamic ResolveCreatedMath(dynamic document, dynamic equationRange, dynamic mathRange, int start, int end)
@@ -2895,16 +3523,158 @@ public sealed class OfficeDocumentService
         }
     }
 
-    private static bool IsWpsDocument(dynamic document)
+    private static bool TryBuildWpsMath(dynamic math)
+    {
+        if (math == null) return false;
+        var invoked = false;
+
+        // WPS 的 OMath.Parent 是创建该公式的 OMaths 集合。实测只有这个
+        // BuildUp 稳定地把 e^x、x_1、分式和 eqarray 从线性输入构建成
+        // 专业公式，因此必须最先调用；后两种入口作为不同 WPS 版本的补充。
+        try { math.Parent.BuildUp(); invoked = true; } catch { }
+        try { math.BuildUp(); invoked = true; } catch { }
+        try { math.Range.OMaths.BuildUp(); invoked = true; } catch { }
+        return invoked;
+    }
+
+    private static bool TryBuildWpsMathsInHolder(dynamic holder)
+    {
+        if (holder == null) return false;
+        var invoked = false;
+        dynamic collection = null;
+        try { collection = holder.OMaths; } catch { }
+        if (collection == null) return false;
+
+        // Parent.BuildUp 可能使集合立即刷新，所以先按当前数量逐项处理，再对
+        // 刷新后的集合补一次 BuildUp。整个过程只构建，不再调用 Add。
+        var count = SafeCollectionCount(collection);
+        for (var index = 1; index <= count; index++)
+        {
+            try
+            {
+                dynamic math;
+                try { math = collection.Item(index); }
+                catch { math = collection[index]; }
+                invoked |= TryBuildWpsMath(math);
+            }
+            catch { }
+        }
+        try { collection.BuildUp(); invoked = true; } catch { }
+        return invoked;
+    }
+
+    private static bool IsProfessionallyBuiltOfficeMath(dynamic math, string linearSource)
+    {
+        if (!IsSubstantiveOfficeMath(math)) return false;
+        string raw;
+        try { raw = Convert.ToString(math.Range.Text) ?? String.Empty; }
+        catch { return false; }
+
+        // 无论源式是否需要上下标、分式等结构，只要可见内容仍带 TeX/Word
+        // 线性控制命令、eqarray 对齐符或公式占位提示，就属于半成品。
+        if (HasUnbuiltOfficeMathSyntax(raw)) return false;
+        if (!RequiresStructuredOfficeMath(linearSource)) return true;
+
+        // WPS 会给尚未构建的线性公式也暴露一个 OMathFunction，因此
+        // Functions.Count 不能作为依据。只有 OOXML 中真正出现 sSup、f、
+        // eqArr 等结构节点，才说明公式已经从线性文本构建为专业格式。
+        if (HasStructuredOfficeMathXml(math)) return true;
+
+        // Functions/WordOpenXML 在少数精简版 WPS 中不可访问。此时仍要拒绝
+        // 明显保留命令或线性结构标记的对象，避免把半成品留在文档中。
+        try
+        {
+            return !HasUnbuiltOfficeMathSyntax(raw);
+        }
+        catch { return false; }
+    }
+
+    private static bool RequiresStructuredOfficeMath(string source)
+    {
+        var value = source ?? String.Empty;
+        if (value.IndexOf('^') >= 0 || value.IndexOf('_') >= 0 ||
+            value.IndexOf('√') >= 0 || value.IndexOf('∑') >= 0 ||
+            value.IndexOf('∏') >= 0 || value.IndexOf('∫') >= 0 ||
+            value.IndexOf('∬') >= 0 || value.IndexOf('∭') >= 0 ||
+            value.IndexOf('∮') >= 0 || value.IndexOf('〖') >= 0 ||
+            value.IndexOf('〗') >= 0) return true;
+        return Regex.IsMatch(value,
+            @"\\(?:d?frac|tfrac|cfrac|genfrac|eqarray|matrix|cases|binom|bar|hat|tilde|vec|sqrt|overbrace|underbrace|begin)\s*(?:\{|\()",
+            RegexOptions.IgnoreCase);
+    }
+
+    private static bool HasStructuredOfficeMathXml(dynamic math)
     {
         try
         {
-            var name = Convert.ToString(document.Application.Name) ?? String.Empty;
-            return name.IndexOf("WPS", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   name.IndexOf("Kingsoft", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   name.IndexOf("金山", StringComparison.OrdinalIgnoreCase) >= 0;
+            var xml = Convert.ToString(math.Range.WordOpenXML) ?? String.Empty;
+            return Regex.IsMatch(xml,
+                @"<m:(?:f|rad|nary|sSub|sSup|sSubSup|eqArr|m|d|limLow|limUpp|groupChr|bar|acc|func)\b",
+                RegexOptions.IgnoreCase);
         }
         catch { return false; }
+    }
+
+    private static bool HasUnbuiltOfficeMathSyntax(string source)
+    {
+        var value = source ?? String.Empty;
+        if (value.IndexOf("在此处键入公式", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            value.IndexOf("Type equation here", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+        if (Regex.IsMatch(value, @"\\[A-Za-z]+", RegexOptions.IgnoreCase)) return true;
+        if (value.IndexOf('〖') >= 0 || value.IndexOf('〗') >= 0) return true;
+        if (value.IndexOf('^') >= 0 || value.IndexOf('_') >= 0) return true;
+        if (Regex.IsMatch(value,
+            @"(?<=[\p{L}\p{N}\)\]])\s*/\s*(?=[\p{L}\p{N}\(\[])",
+            RegexOptions.IgnoreCase)) return true;
+        // @ 和 & 只在这里作为仍带 eqarray 对齐语法的信号；普通正文公式
+        // 不会把它们作为运算符写入 OMath。
+        return value.IndexOf('@') >= 0 || value.IndexOf('&') >= 0;
+    }
+
+    private static bool TryBuildMathHolder(dynamic holder)
+    {
+        if (holder == null) return false;
+        try { holder.OMaths.BuildUp(); return true; }
+        catch
+        {
+            try { holder.BuildUp(); return true; }
+            catch
+            {
+                try { holder.Parent.BuildUp(); return true; }
+                catch { return false; }
+            }
+        }
+    }
+
+    private static bool IsWpsDocument(dynamic document)
+    {
+        // 新版 WPS 为兼容 Word，Application.Name 可能返回“Microsoft Word”。
+        // 加载项运行在 wps.exe 内，进程名是最稳定的宿主判定依据。
+        try
+        {
+            var processName = Process.GetCurrentProcess().ProcessName ?? String.Empty;
+            if (String.Equals(processName, "wps", StringComparison.OrdinalIgnoreCase) ||
+                String.Equals(processName, "wpsoffice", StringComparison.OrdinalIgnoreCase) ||
+                String.Equals(processName, "wpscloudsvr", StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        catch { }
+        try
+        {
+            var application = document.Application;
+            var name = Convert.ToString(application.Name) ?? String.Empty;
+            if (name.IndexOf("WPS", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("Kingsoft", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("金山", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            try
+            {
+                var path = Convert.ToString(application.Path) ?? String.Empty;
+                if (path.IndexOf("WPS Office", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    path.IndexOf("Kingsoft", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            }
+            catch { }
+        }
+        catch { }
+        return false;
     }
 
     private static string[] PrepareLatexRows(string latex)
@@ -3077,9 +3847,42 @@ public sealed class OfficeDocumentService
         value = value.Replace("\\triangle", "\u25b3");
         value = value.Replace("\\emptyset", "\u2205").Replace("\\varnothing", "\u2205");
         value = ReplaceAdditionalLatexSymbols(value);
+        // TeX 常把单字符上下标写成 x_{a}、x^{2}。Word/WPS 的
+        // UnicodeMath 对 _ (a) 这类带括号的单字符脚本解析不稳定，
+        // 尤其出现在绝对值或较长表达式中时会停留在线性格式。
+        // 单原子脚本改写为 _a/^2，复杂脚本仍用括号保护作用域。
+        value = NormalizeUnicodeMathScriptGroups(value);
         value = value.Replace("\\{", "\uE100").Replace("\\}", "\uE101");
         value = value.Replace("{", "(").Replace("}", ")").Replace("\uE100", "{").Replace("\uE101", "}");
         return RemoveUnmatchedClosingParentheses(Regex.Replace(value, @"[ \t]+", " ").Trim());
+    }
+
+    private static string NormalizeUnicodeMathScriptGroups(string source)
+    {
+        if (String.IsNullOrEmpty(source)) return source ?? String.Empty;
+        var value = source;
+        for (var index = 0; index < value.Length; index++)
+        {
+            if (value[index] != '_' && value[index] != '^') continue;
+            if (index > 0 && value[index - 1] == '\\') continue;
+            var cursor = index + 1;
+            while (cursor < value.Length && Char.IsWhiteSpace(value[cursor])) cursor++;
+            if (cursor >= value.Length || value[cursor] != '{') continue;
+            string body;
+            int end;
+            if (!TryReadGroup(value, cursor, out body, out end)) continue;
+            body = NormalizeUnicodeMathScriptGroups((body ?? String.Empty).Trim());
+            if (body.Length == 0) continue;
+            var singleAtom = body.Length == 1 || body.Length == 2 && Char.IsSurrogatePair(body, 0);
+            var separator = singleAtom && end < value.Length &&
+                            (Char.IsLetterOrDigit(value[end]) || value[end] == '\\' || value[end] > 127)
+                ? " "
+                : String.Empty;
+            var replacement = value[index] + (singleAtom ? body : "(" + body + ")") + separator;
+            value = value.Substring(0, index) + replacement + value.Substring(end);
+            index += replacement.Length - 1;
+        }
+        return value;
     }
 
     private static string BuildLinearFraction(string numerator, string denominator)
@@ -3363,6 +4166,103 @@ public sealed class OfficeDocumentService
         return false;
     }
 
+    private static int ApplyRegexInRangePreservingMath(
+        object documentObject,
+        object scopeObject,
+        string pattern,
+        Func<Match, string> replacement,
+        RegexOptions options = RegexOptions.None)
+    {
+        dynamic document = documentObject;
+        dynamic scope = scopeObject;
+        if (scope == null || String.IsNullOrEmpty(pattern) || replacement == null) return 0;
+        var source = Convert.ToString(scope.Text) ?? String.Empty;
+        if (source.Length == 0) return 0;
+        var matches = Regex.Matches(source, pattern, options);
+        if (matches.Count == 0) return 0;
+        var scopeStart = (int)scope.Start;
+        var scopeEnd = (int)scope.End;
+        var protectedSpans = GetOfficeMathSpans((object)document, scopeStart, scopeEnd);
+        var changed = 0;
+        for (var index = matches.Count - 1; index >= 0; index--)
+        {
+            var match = matches[index];
+            var absoluteStart = scopeStart + match.Index;
+            var absoluteEnd = absoluteStart + match.Length;
+            if (protectedSpans.Any(span =>
+                    absoluteStart < span.Item2 && absoluteEnd > span.Item1)) continue;
+            var value = replacement(match) ?? String.Empty;
+            if (String.Equals(match.Value, value, StringComparison.Ordinal)) continue;
+            try
+            {
+                document.Range(absoluteStart, absoluteEnd).Text = value;
+                changed++;
+            }
+            catch { }
+        }
+        return changed;
+    }
+
+    private static int InsertParagraphsBeforeInlineHeadings(dynamic document, dynamic scope)
+    {
+        var source = Convert.ToString(scope.Text) ?? String.Empty;
+        if (source.Length == 0) return 0;
+        var matches = Regex.Matches(source, @"(?<![\p{L}\p{N}\\#])#{1,6}[ \t]+\S");
+        var scopeStart = (int)scope.Start;
+        var scopeEnd = (int)scope.End;
+        var protectedSpans = GetOfficeMathSpans((object)document, scopeStart, scopeEnd);
+        var changed = 0;
+        for (var index = matches.Count - 1; index >= 0; index--)
+        {
+            var match = matches[index];
+            if (match.Index == 0) continue;
+            var previous = source[match.Index - 1];
+            if (previous == '\r' || previous == '\n' || previous == '\v' ||
+                previous == '\f' || previous == '\u0085' || previous == '\u2028' ||
+                previous == '\u2029') continue;
+            var absolute = scopeStart + match.Index;
+            if (protectedSpans.Any(span => absolute > span.Item1 && absolute < span.Item2)) continue;
+            try
+            {
+                document.Range(absolute, absolute).Text = "\r";
+                changed++;
+            }
+            catch { }
+        }
+        return changed;
+    }
+
+    private static int InsertParagraphsBetweenMarkdownHeadingsAndMath(dynamic document, dynamic scope)
+    {
+        var scopeStart = 0;
+        var scopeEnd = 0;
+        try { scopeStart = (int)scope.Start; scopeEnd = (int)scope.End; }
+        catch { return 0; }
+        var spans = GetOfficeMathSpans((object)document, scopeStart, scopeEnd)
+            .OrderByDescending(span => span.Item1).ToList();
+        var changed = 0;
+        foreach (var span in spans)
+        {
+            try
+            {
+                dynamic paragraph = document.Range(span.Item1, span.Item1).Paragraphs[1].Range;
+                var paragraphStart = (int)paragraph.Start;
+                if (span.Item1 <= paragraphStart) continue;
+                var prefix = Convert.ToString(document.Range(paragraphStart, span.Item1).Text) ?? String.Empty;
+                var heading = Regex.Match(prefix,
+                    @"^[ \t]*(?<marks>#{1,6})[ \t]+(?<title>[^\r\n\v\f\u0085\u2028\u2029]{2,80}?)[ \t]*$");
+                if (!heading.Success) continue;
+                var title = heading.Groups["title"].Value.Trim();
+                if (!Regex.IsMatch(title,
+                    @"(?:步骤(?:[ \t]*\d+)?(?:[：:].{0,40})?|题意翻译|核心(?:公式|结论|关键)?|求解过程|原表达式|五倍角公式|公式|定义|定理|证明|解答|解析|讨论|方法|变形|化简|推导|结论)[：:]?$")) continue;
+                document.Range(span.Item1, span.Item1).Text = "\r";
+                changed++;
+            }
+            catch { }
+        }
+        return changed;
+    }
+
     public int CollapseRepeatedSpaces()
     {
         return CollapseRepeatedSpaces("Document");
@@ -3380,26 +4280,23 @@ public sealed class OfficeDocumentService
             range = selected.Duplicate;
         }
         dynamic trackingRange = range.Duplicate;
-        var passes = 0;
-        while (passes < 30)
-        {
-            dynamic passRange = trackingRange.Duplicate;
-            dynamic find = passRange.Find;
-            find.ClearFormatting();
-            find.Replacement.ClearFormatting();
-            find.Text = "  ";
-            find.Replacement.Text = " ";
-            find.Forward = true;
-            find.Wrap = selectionOnly ? 0 : 1;
-            find.Format = false;
-            find.MatchWildcards = false;
-            var changed = ExecuteReplaceAll(find);
-            if (!changed) changed = ReplaceLiteralRangesInRange(document, passRange, "  ", " ") > 0;
-            if (!changed) break;
-            passes++;
-        }
+        var changed = 0;
+        // 小范围倒序替换，不重写整篇 Range.Text；WPS 中已有公式对象因此不会
+        // 被空格清理还原成线性文本。
+        changed += ApplyRegexInRangePreservingMath((object)document, (object)trackingRange,
+            @"[\u00A0\u202F]", match => " ");
+        changed += ApplyRegexInRangePreservingMath((object)document, (object)trackingRange,
+            @"[ \u3000]{2,}", match => " ");
+        changed += ApplyRegexInRangePreservingMath((object)document, (object)trackingRange,
+            @"\t{2,}", match => "\t");
+        changed += ApplyRegexInRangePreservingMath((object)document, (object)trackingRange,
+            @"[ \t\u3000]+(?=[\r\n\a\v\f\u0085\u2028\u2029])", match => String.Empty);
+        changed += ApplyRegexInRangePreservingMath((object)document, (object)trackingRange,
+            @"(?<=[\r\n\v\f\u0085\u2028\u2029])[ \t\u3000]+(?=\S)", match => String.Empty);
+        changed += ApplyRegexInRangePreservingMath((object)document, (object)trackingRange,
+            @"\A[ \t\u3000]+(?=\S)", match => String.Empty);
         SelectScopeRange(trackingRange, scope);
-        return passes;
+        return changed;
     }
 
     public int NormalizeBlankLines(string scope)
@@ -3413,10 +4310,23 @@ public sealed class OfficeDocumentService
             range = selected.Duplicate;
         }
         dynamic trackingRange = range.Duplicate;
-        var rounds = 0;
-        while (rounds < 12 && ReplaceLiteralRangesInRange(document, trackingRange.Duplicate, "\r\r\r", "\r\r") > 0) rounds++;
+        var changed = 0;
+        changed += ApplyRegexInRangePreservingMath((object)document, (object)trackingRange,
+            // FF 是 Word/WPS 的手动分页符，清理空行时必须保留。
+            @"\r\n|[\n\v\u0085\u2028\u2029]", match => "\r");
+        for (var pass = 0; pass < 3; pass++)
+        {
+            var current = ApplyRegexInRangePreservingMath((object)document, (object)trackingRange,
+                @"\r[ \t\u00A0\u202F\u3000]+\r", match => "\r\r");
+            changed += current;
+            if (current == 0) break;
+        }
+        changed += ApplyRegexInRangePreservingMath((object)document, (object)trackingRange,
+            @"\r{3,}", match => "\r\r");
+        changed += ApplyRegexInRangePreservingMath((object)document, (object)trackingRange,
+            @"\A(?:[ \t\u00A0\u202F\u3000]*\r)+(?=\S)", match => String.Empty);
         SelectScopeRange(trackingRange, scope);
-        return rounds;
+        return changed;
     }
 
     private static int ReplaceLiteralRangesInRange(dynamic document, dynamic scope, string findText, string replaceText)

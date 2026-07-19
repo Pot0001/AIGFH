@@ -15,11 +15,11 @@ internal static class Program
     private const string ProgId = "AIGFH.Connect";
     private const string LegacyProgId = "OfflineOfficeAddIn.Connect";
     private const string ManagedCategory = "{62C8FE65-4EBB-45E7-B440-6E39B2CDBF29}";
-    private const string AssemblyName = "AIGFH, Version=1.1.3.0, Culture=neutral, PublicKeyToken=null";
     private const string ProductName = "AI规范化";
-    private const string PackageVersion = "1.1.3";
+    private const string PackageVersion = "1.1.5";
     private static readonly string ProjectUrl = "https://github.com/" + ReadResourceText("Payload.ProjectRepository.txt");
     private const string UninstallKey = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\AIGFH";
+    private const int NetFramework48Release = 528040;
     private const int MoveFileDelayUntilReboot = 0x4;
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -53,12 +53,19 @@ internal static class Program
     {
         try
         {
+            if (!HasNetFramework48())
+            {
+                const string runtimeMessage = "需要先安装 .NET Framework 4.8，再重新运行安装包。";
+                if (!silent) MessageBox.Show(runtimeMessage, ProductName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                else Console.Error.WriteLine(runtimeMessage);
+                return 3;
+            }
             var running = IsOfficeRunning();
             var installDirectory = InstallFiles();
             RemoveLegacyRegistration();
             RegisterCom(Path.Combine(installDirectory, "AIGFH.dll"));
             RegisterHost("Software\\Microsoft\\Office\\Word\\Addins\\" + ProgId);
-            RegisterHost("Software\\Kingsoft\\Office\\WPS\\Addins\\" + ProgId);
+            RegisterWpsWhitelist();
             ClearWordDisabledItems();
             WriteUninstallerInfo(installDirectory);
 
@@ -96,6 +103,23 @@ internal static class Program
             else Console.Error.WriteLine(error);
             return 1;
         }
+    }
+
+    private static bool HasNetFramework48()
+    {
+        if (HasNetFramework48(RegistryView.Registry32)) return true;
+        return Environment.Is64BitOperatingSystem && HasNetFramework48(RegistryView.Registry64);
+    }
+
+    private static bool HasNetFramework48(RegistryView view)
+    {
+        try
+        {
+            using (var localMachine = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view))
+            using (var framework = localMachine.OpenSubKey("SOFTWARE\\Microsoft\\NET Framework Setup\\NDP\\v4\\Full"))
+                return framework != null && Convert.ToInt32(framework.GetValue("Release", 0)) >= NetFramework48Release;
+        }
+        catch { return false; }
     }
 
     private static int RunCleanup(string path, int parentId)
@@ -188,6 +212,8 @@ internal static class Program
             }
             else if (!install && code == 2)
                 _status.Text = "请先关闭全部 Word 和 WPS 窗口，再重试。";
+            else if (install && code == 3)
+                _status.Text = "需要先安装 .NET Framework 4.8。";
             else
                 _status.Text = install ? "配置未完成，请关闭 Word 和 WPS 后重试。" : "移除未完成，请重试。";
         }
@@ -214,8 +240,16 @@ internal static class Program
             }
             else if (comparison == 0)
             {
-                _install.Text = "重新安装";
-                _status.Text = "本机已安装当前版本。";
+                if (IsInstallationHealthy())
+                {
+                    _install.Text = "重新安装";
+                    _status.Text = "本机已安装当前版本。";
+                }
+                else
+                {
+                    _install.Text = "修复";
+                    _status.Text = "检测到组件缺失，重新配置即可。";
+                }
             }
             else
             {
@@ -231,6 +265,52 @@ internal static class Program
                 if (key == null) return null;
                 var value = Convert.ToString(key.GetValue("DisplayVersion"));
                 return String.IsNullOrWhiteSpace(value) ? "未知" : value.Trim();
+            }
+        }
+
+        private static bool IsInstallationHealthy()
+        {
+            try
+            {
+                string installDirectory;
+                using (var uninstall = Registry.CurrentUser.OpenSubKey(UninstallKey))
+                    installDirectory = uninstall == null ? null : Convert.ToString(uninstall.GetValue("InstallLocation"));
+                if (String.IsNullOrWhiteSpace(installDirectory)) return false;
+
+                var dllPath = Path.Combine(installDirectory, "AIGFH.dll");
+                if (!File.Exists(dllPath)) return false;
+
+                using (var word = Registry.CurrentUser.OpenSubKey("Software\\Microsoft\\Office\\Word\\Addins\\" + ProgId))
+                {
+                    if (word == null || Convert.ToInt32(word.GetValue("LoadBehavior", 0)) != 3) return false;
+                }
+
+                using (var whitelist = Registry.CurrentUser.OpenSubKey("Software\\Kingsoft\\Office\\WPS\\AddinsWL"))
+                {
+                    if (whitelist == null || !Array.Exists(whitelist.GetValueNames(), name => String.Equals(name, ProgId, StringComparison.OrdinalIgnoreCase)))
+                        return false;
+                }
+
+                if (!IsComRegistrationHealthy(RegistryView.Registry32, dllPath)) return false;
+                if (Environment.Is64BitOperatingSystem && !IsComRegistrationHealthy(RegistryView.Registry64, dllPath)) return false;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static bool IsComRegistrationHealthy(RegistryView view, string expectedDllPath)
+        {
+            using (var currentUser = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
+            using (var server = currentUser.OpenSubKey("Software\\Classes\\CLSID\\" + Clsid + "\\InprocServer32"))
+            {
+                if (server == null) return false;
+                var codeBase = Convert.ToString(server.GetValue("CodeBase"));
+                Uri uri;
+                var registeredPath = Uri.TryCreate(codeBase, UriKind.Absolute, out uri) && uri.IsFile
+                    ? uri.LocalPath
+                    : codeBase;
+                if (String.IsNullOrWhiteSpace(registeredPath) || !File.Exists(registeredPath)) return false;
+                return String.Equals(Path.GetFullPath(registeredPath), Path.GetFullPath(expectedDllPath), StringComparison.OrdinalIgnoreCase);
             }
         }
 
@@ -325,14 +405,24 @@ internal static class Program
     private static void RegisterCom(string dllPath)
     {
         var codeBase = new Uri(Path.GetFullPath(dllPath)).AbsoluteUri;
-        RegisterComRoot("Software\\Classes", codeBase);
-        if (Environment.Is64BitOperatingSystem) RegisterComRoot("Software\\Classes\\Wow6432Node", codeBase);
+        var payload = System.Reflection.AssemblyName.GetAssemblyName(dllPath);
+        var assemblyFullName = payload.FullName;
+        var assemblyVersion = payload.Version == null ? "1.0.0.0" : payload.Version.ToString();
+
+        // CLSID is a redirected key on 64-bit Windows.  Register through the
+        // explicit views instead of writing the reserved Wow6432Node path.
+        // The AnyCPU managed add-in can then be activated by either x86 or x64
+        // Word/WPS through the matching mscoree.dll registration.
+        RegisterComView(RegistryView.Registry32, codeBase, assemblyFullName, assemblyVersion);
+        if (Environment.Is64BitOperatingSystem)
+            RegisterComView(RegistryView.Registry64, codeBase, assemblyFullName, assemblyVersion);
     }
 
-    private static void RegisterComRoot(string classesRoot, string codeBase)
+    private static void RegisterComView(RegistryView view, string codeBase, string assemblyFullName, string assemblyVersion)
     {
-        using (var currentUser = Registry.CurrentUser)
+        using (var currentUser = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
         {
+            const string classesRoot = "Software\\Classes";
             var clsidRoot = classesRoot + "\\CLSID\\" + Clsid;
             // Remove versioned InprocServer32 entries left by older builds.
             // mscoree may otherwise select a stale highest-version CodeBase.
@@ -344,14 +434,14 @@ internal static class Program
                 server.SetValue(null, "mscoree.dll");
                 server.SetValue("ThreadingModel", "Both");
                 server.SetValue("Class", ProgId);
-                server.SetValue("Assembly", AssemblyName);
+                server.SetValue("Assembly", assemblyFullName);
                 server.SetValue("RuntimeVersion", "v4.0.30319");
                 server.SetValue("CodeBase", codeBase);
             }
-            using (var version = currentUser.CreateSubKey(clsidRoot + "\\InprocServer32\\1.1.3.0"))
+            using (var version = currentUser.CreateSubKey(clsidRoot + "\\InprocServer32\\" + assemblyVersion))
             {
                 version.SetValue("Class", ProgId);
-                version.SetValue("Assembly", AssemblyName);
+                version.SetValue("Assembly", assemblyFullName);
                 version.SetValue("RuntimeVersion", "v4.0.30319");
                 version.SetValue("CodeBase", codeBase);
             }
@@ -367,6 +457,11 @@ internal static class Program
     {
         Registry.CurrentUser.DeleteSubKeyTree("Software\\Microsoft\\Office\\Word\\Addins\\" + LegacyProgId, false);
         Registry.CurrentUser.DeleteSubKeyTree("Software\\Kingsoft\\Office\\WPS\\Addins\\" + LegacyProgId, false);
+        // Older installers wrote a non-standard WPS Addins subkey.  WPS COM
+        // add-ins are discovered from the Word Addins key and authorized by
+        // the AddinsWL value below.
+        Registry.CurrentUser.DeleteSubKeyTree("Software\\Kingsoft\\Office\\WPS\\Addins\\" + ProgId, false);
+        RemoveWpsWhitelistValue(LegacyProgId);
         Registry.CurrentUser.DeleteSubKeyTree("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\AIGFH-AIDocumentNormalizer", false);
     }
 
@@ -377,7 +472,28 @@ internal static class Program
             key.SetValue("FriendlyName", ProductName + " v" + PackageVersion);
             key.SetValue("Description", "免费｜Word/WPS 文本、TeX 公式、表格与试卷排版工具｜" + ProjectUrl);
             key.SetValue("LoadBehavior", 3, RegistryValueKind.DWord);
+            // This is a classic IDTExtensibility2 COM add-in, not a VSTO
+            // deployment.  CommandLineSafe is required by Office/WPS; startup
+            // only connects the add-in and does not run document commands or
+            // display modal UI, so command-line host startup is safe.
+            // Do not add a Manifest value, which would invoke the VSTO loader.
+            key.SetValue("CommandLineSafe", 1, RegistryValueKind.DWord);
         }
+    }
+
+    private static void RegisterWpsWhitelist()
+    {
+        // WPS Writer reads the normal Microsoft Word Addins registration and
+        // requires the ProgID in its per-user COM add-in whitelist.  The value
+        // is REG_SZ with empty data; this path is shared by x86 and x64 WPS.
+        using (var key = Registry.CurrentUser.CreateSubKey("Software\\Kingsoft\\Office\\WPS\\AddinsWL"))
+            key.SetValue(ProgId, String.Empty, RegistryValueKind.String);
+    }
+
+    private static void RemoveWpsWhitelistValue(string progId)
+    {
+        using (var key = Registry.CurrentUser.OpenSubKey("Software\\Kingsoft\\Office\\WPS\\AddinsWL", true))
+            if (key != null) key.DeleteValue(progId, false);
     }
 
     private static void ClearWordDisabledItems()
@@ -425,8 +541,10 @@ internal static class Program
         Registry.CurrentUser.DeleteSubKeyTree("Software\\Kingsoft\\Office\\WPS\\Addins\\" + ProgId, false);
         Registry.CurrentUser.DeleteSubKeyTree("Software\\Microsoft\\Office\\Word\\Addins\\" + LegacyProgId, false);
         Registry.CurrentUser.DeleteSubKeyTree("Software\\Kingsoft\\Office\\WPS\\Addins\\" + LegacyProgId, false);
-        DeleteComRoot("Software\\Classes");
-        if (Environment.Is64BitOperatingSystem) DeleteComRoot("Software\\Classes\\Wow6432Node");
+        RemoveWpsWhitelistValue(ProgId);
+        RemoveWpsWhitelistValue(LegacyProgId);
+        DeleteComView(RegistryView.Registry32);
+        if (Environment.Is64BitOperatingSystem) DeleteComView(RegistryView.Registry64);
         Registry.CurrentUser.DeleteSubKeyTree("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\AIGFH", false);
         Registry.CurrentUser.DeleteSubKeyTree("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\AIGFH-AIDocumentNormalizer", false);
         Registry.CurrentUser.DeleteSubKeyTree("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\AI规范化Y01", false);
@@ -455,11 +573,15 @@ internal static class Program
         catch { }
     }
 
-    private static void DeleteComRoot(string classesRoot)
+    private static void DeleteComView(RegistryView view)
     {
-        Registry.CurrentUser.DeleteSubKeyTree(classesRoot + "\\CLSID\\" + Clsid, false);
-        Registry.CurrentUser.DeleteSubKeyTree(classesRoot + "\\" + ProgId, false);
-        Registry.CurrentUser.DeleteSubKeyTree(classesRoot + "\\" + LegacyProgId, false);
+        using (var currentUser = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
+        {
+            const string classesRoot = "Software\\Classes";
+            currentUser.DeleteSubKeyTree(classesRoot + "\\CLSID\\" + Clsid, false);
+            currentUser.DeleteSubKeyTree(classesRoot + "\\" + ProgId, false);
+            currentUser.DeleteSubKeyTree(classesRoot + "\\" + LegacyProgId, false);
+        }
     }
 
     private static bool IsOfficeRunning()

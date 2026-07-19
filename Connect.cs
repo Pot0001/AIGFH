@@ -122,7 +122,7 @@ public sealed class Connect : IRibbonCallbacks, IDTExtensibility2, IRibbonExtens
             <button id=""CopyAiPrompt"" label=""复制 AI 提示词"" screentip=""复制推荐提示词"" supertip=""复制后粘贴到 AI，并在末尾填写具体任务。"" onAction=""OnRibbonButton"" />
             <button id=""OpenProjectHome"" label=""关于与反馈"" onAction=""OnRibbonButton"" />
           </menu>
-          <labelControl id=""VersionLabel"" label=""版本：1.1.3"" />
+          <labelControl id=""VersionLabel"" label=""版本：1.1.5"" />
         </group>
       </tab>
     </tabs>
@@ -182,10 +182,10 @@ public sealed class Connect : IRibbonCallbacks, IDTExtensibility2, IRibbonExtens
                 case "NormalizeFormulaDocument": settings.ProcessingScope = "Document"; SetFormulaStatus(service.NormalizeUnifiedAiFormulas(settings), "整篇文档"); break;
                 case "NormalizeTextSelection": settings.ProcessingScope = "Selection"; SetStatus(service.NormalizeUnifiedAiText(settings) > 0 ? "选区文本规范完成。" : "选区没有可处理文本。"); break;
                 case "NormalizeTextDocument": settings.ProcessingScope = "Document"; SetStatus(service.NormalizeUnifiedAiText(settings) > 0 ? "全文文本规范完成。" : "文档没有可处理文本。"); break;
-                case "NormalizeExamA3Landscape": SetStatus("A3 横版已应用；转换 " + service.NormalizeExamPaper(settings, 6, true) + " 个公式。"); break;
-                case "NormalizeExamA3Portrait": SetStatus("A3 竖版已应用；转换 " + service.NormalizeExamPaper(settings, 6, false) + " 个公式。"); break;
-                case "NormalizeExamA4Landscape": SetStatus("A4 横版已应用；转换 " + service.NormalizeExamPaper(settings, 7, true) + " 个公式。"); break;
-                case "NormalizeExamA4Portrait": SetStatus("A4 竖版已应用；转换 " + service.NormalizeExamPaper(settings, 7, false) + " 个公式。"); break;
+                case "NormalizeExamA3Landscape": SetStatus("A3 横版已应用；公式已处理 " + service.NormalizeExamPaper(settings, 6, true) + " 个。"); break;
+                case "NormalizeExamA3Portrait": SetStatus("A3 竖版已应用；公式已处理 " + service.NormalizeExamPaper(settings, 6, false) + " 个。"); break;
+                case "NormalizeExamA4Landscape": SetStatus("A4 横版已应用；公式已处理 " + service.NormalizeExamPaper(settings, 7, true) + " 个。"); break;
+                case "NormalizeExamA4Portrait": SetStatus("A4 竖版已应用；公式已处理 " + service.NormalizeExamPaper(settings, 7, false) + " 个。"); break;
                 case "ConvertMathToTex":
                 case "MathToMarkdown":
                 {
