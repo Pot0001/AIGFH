@@ -120,7 +120,7 @@ public sealed class Connect : IRibbonCallbacks, IDTExtensibility2, IRibbonExtens
             <button id=""CheckUpdates"" label=""检查更新"" onAction=""OnRibbonButton"" />
             <button id=""OpenProjectHome"" label=""关于与反馈"" onAction=""OnRibbonButton"" />
           </menu>
-          <labelControl id=""VersionLabel"" label=""版本：1.1.0"" />
+          <labelControl id=""VersionLabel"" label=""版本：1.1.1"" />
         </group>
       </tab>
     </tabs>
@@ -311,19 +311,97 @@ public sealed class Connect : IRibbonCallbacks, IDTExtensibility2, IRibbonExtens
             form.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog;
             form.MaximizeBox = false;
             form.MinimizeBox = false;
-            form.ClientSize = new Size(520, 270);
+            form.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Dpi;
+            form.ClientSize = new Size(560, 300);
             form.BackColor = Color.White;
-            form.Controls.Add(new System.Windows.Forms.Label { Text = "AI规范化", Font = new Font("Microsoft YaHei UI", 19F, FontStyle.Bold), ForeColor = Color.FromArgb(30, 64, 175), AutoSize = true, Location = new Point(28, 24) });
-            form.Controls.Add(new System.Windows.Forms.Label { Text = "Word/WPS 文本、公式、表格与试卷排版工具", AutoSize = true, Location = new Point(31, 72), ForeColor = Color.FromArgb(51, 65, 85) });
-            form.Controls.Add(new System.Windows.Forms.Label { Text = "版本 " + UpdateChecker.CurrentVersion + "  ·  免费使用", AutoSize = true, Location = new Point(31, 104), ForeColor = Color.FromArgb(30, 64, 175) });
-            form.Controls.Add(new System.Windows.Forms.Label { Text = "下载、更新和问题反馈：", AutoSize = true, Location = new Point(31, 139), ForeColor = Color.FromArgb(71, 85, 105) });
-            var link = new System.Windows.Forms.LinkLabel { Text = url, AutoSize = true, Location = new Point(31, 164), LinkColor = Color.FromArgb(37, 99, 235) };
+
+            var layout = new System.Windows.Forms.TableLayoutPanel
+            {
+                Dock = System.Windows.Forms.DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 7,
+                Padding = new System.Windows.Forms.Padding(32, 24, 32, 20),
+                BackColor = Color.White
+            };
+            layout.ColumnStyles.Add(new System.Windows.Forms.ColumnStyle(System.Windows.Forms.SizeType.Percent, 100F));
+            for (var index = 0; index < 6; index++)
+                layout.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.AutoSize));
+            layout.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 100F));
+
+            var title = new System.Windows.Forms.Label
+            {
+                Text = "AI规范化",
+                Font = new Font("Microsoft YaHei UI", 20F, FontStyle.Bold),
+                ForeColor = Color.FromArgb(30, 64, 175),
+                AutoSize = true,
+                Margin = new System.Windows.Forms.Padding(0, 0, 0, 8)
+            };
+            var subtitle = new System.Windows.Forms.Label
+            {
+                Text = "Word / WPS 文本、公式、表格与试卷排版工具",
+                Font = new Font("Microsoft YaHei UI", 10F),
+                ForeColor = Color.FromArgb(51, 65, 85),
+                AutoSize = true,
+                Margin = new System.Windows.Forms.Padding(1, 0, 0, 12)
+            };
+            var version = new System.Windows.Forms.Label
+            {
+                Text = "版本 " + UpdateChecker.CurrentVersion + "    免费使用",
+                Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold),
+                ForeColor = Color.FromArgb(30, 64, 175),
+                AutoSize = true,
+                Margin = new System.Windows.Forms.Padding(1, 0, 0, 18)
+            };
+            var description = new System.Windows.Forms.Label
+            {
+                Text = "项目介绍、下载、更新与问题反馈",
+                ForeColor = Color.FromArgb(71, 85, 105),
+                AutoSize = true,
+                Margin = new System.Windows.Forms.Padding(1, 0, 0, 4)
+            };
+            var link = new System.Windows.Forms.LinkLabel
+            {
+                Text = url,
+                AutoSize = true,
+                LinkColor = Color.FromArgb(37, 99, 235),
+                ActiveLinkColor = Color.FromArgb(30, 64, 175),
+                Margin = new System.Windows.Forms.Padding(1, 0, 0, 0)
+            };
             link.LinkClicked += (_, __) => OpenUrl(url);
-            form.Controls.Add(link);
-            var close = new System.Windows.Forms.Button { Text = "关闭", Width = 108, Height = 36, Location = new Point(381, 213), BackColor = Color.FromArgb(37, 99, 235), ForeColor = Color.White, FlatStyle = System.Windows.Forms.FlatStyle.Flat };
+
+            var buttonBar = new System.Windows.Forms.FlowLayoutPanel
+            {
+                Dock = System.Windows.Forms.DockStyle.Fill,
+                FlowDirection = System.Windows.Forms.FlowDirection.RightToLeft,
+                WrapContents = false,
+                Padding = new System.Windows.Forms.Padding(0, 14, 0, 0),
+                Margin = new System.Windows.Forms.Padding(0)
+            };
+            var close = new System.Windows.Forms.Button
+            {
+                Text = "关闭",
+                Width = 108,
+                Height = 36,
+                BackColor = Color.FromArgb(37, 99, 235),
+                ForeColor = Color.White,
+                FlatStyle = System.Windows.Forms.FlatStyle.Flat,
+                DialogResult = System.Windows.Forms.DialogResult.Cancel,
+                Margin = new System.Windows.Forms.Padding(0)
+            };
             close.FlatAppearance.BorderSize = 0;
             close.Click += (_, __) => form.Close();
-            form.Controls.Add(close);
+            buttonBar.Controls.Add(close);
+
+            layout.Controls.Add(title, 0, 0);
+            layout.Controls.Add(subtitle, 0, 1);
+            layout.Controls.Add(version, 0, 2);
+            layout.Controls.Add(description, 0, 3);
+            layout.Controls.Add(link, 0, 4);
+            layout.Controls.Add(new System.Windows.Forms.Panel { Height = 1, Dock = System.Windows.Forms.DockStyle.Top }, 0, 5);
+            layout.Controls.Add(buttonBar, 0, 6);
+            form.Controls.Add(layout);
+            form.AcceptButton = close;
+            form.CancelButton = close;
             form.ShowDialog();
         }
     }

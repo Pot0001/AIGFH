@@ -15,9 +15,9 @@ internal static class Program
     private const string ProgId = "AIGFH.Connect";
     private const string LegacyProgId = "OfflineOfficeAddIn.Connect";
     private const string ManagedCategory = "{62C8FE65-4EBB-45E7-B440-6E39B2CDBF29}";
-    private const string AssemblyName = "AIGFH, Version=1.1.0.0, Culture=neutral, PublicKeyToken=null";
+    private const string AssemblyName = "AIGFH, Version=1.1.1.0, Culture=neutral, PublicKeyToken=null";
     private const string ProductName = "AI规范化";
-    private const string PackageVersion = "1.1.0";
+    private const string PackageVersion = "1.1.1";
     private static readonly string ProjectUrl = "https://github.com/" + ReadResourceText("Payload.ProjectRepository.txt");
     private const string UninstallKey = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\AIGFH";
     private const int MoveFileDelayUntilReboot = 0x4;
@@ -347,7 +347,7 @@ internal static class Program
                 server.SetValue("RuntimeVersion", "v4.0.30319");
                 server.SetValue("CodeBase", codeBase);
             }
-            using (var version = currentUser.CreateSubKey(clsidRoot + "\\InprocServer32\\1.1.0.0"))
+            using (var version = currentUser.CreateSubKey(clsidRoot + "\\InprocServer32\\1.1.1.0"))
             {
                 version.SetValue("Class", ProgId);
                 version.SetValue("Assembly", AssemblyName);
