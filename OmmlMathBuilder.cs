@@ -514,7 +514,7 @@ internal static class OmmlMathBuilder
         { "mu", "μ" }, { "nu", "ν" }, { "xi", "ξ" }, { "pi", "π" }, { "varpi", "ϖ" }, { "rho", "ρ" }, { "varrho", "ϱ" },
         { "sigma", "σ" }, { "varsigma", "ς" }, { "tau", "τ" }, { "upsilon", "υ" }, { "phi", "φ" }, { "varphi", "ϕ" }, { "chi", "χ" }, { "psi", "ψ" }, { "omega", "ω" },
         { "Gamma", "Γ" }, { "Delta", "Δ" }, { "Theta", "Θ" }, { "Lambda", "Λ" }, { "Xi", "Ξ" }, { "Pi", "Π" }, { "Sigma", "Σ" }, { "Upsilon", "Υ" }, { "Phi", "Φ" }, { "Psi", "Ψ" }, { "Omega", "Ω" },
-        { "times", "×" }, { "cdot", "·" }, { "div", "÷" }, { "circ", "∘" }, { "pm", "±" }, { "mp", "∓" }, { "leqslant", "≤" }, { "geqslant", "≥" }, { "leq", "≤" }, { "geq", "≥" }, { "le", "≤" }, { "ge", "≥" }, { "neq", "≠" }, { "ne", "≠" },
+        { "times", "×" }, { "cdot", "·" }, { "div", "÷" }, { "circ", "∘" }, { "pm", "±" }, { "mp", "∓" }, { "leqslant", "≤" }, { "geqslant", "≥" }, { "leq", "≤" }, { "geq", "≥" }, { "le", "≤" }, { "ge", "≥" }, { "lt", "<" }, { "gt", ">" }, { "neq", "≠" }, { "ne", "≠" },
         { "approx", "≈" }, { "sim", "∼" }, { "simeq", "≃" }, { "equiv", "≡" }, { "infty", "∞" }, { "in", "∈" }, { "notin", "∉" }, { "subset", "⊂" }, { "subseteq", "⊆" }, { "subsetneq", "⊊" }, { "nsubseteq", "⊈" },
         { "propto", "∝" }, { "cong", "≅" }, { "asymp", "≍" }, { "doteq", "≐" }, { "prec", "≺" }, { "succ", "≻" }, { "preceq", "≼" }, { "succeq", "≽" }, { "ll", "≪" }, { "gg", "≫" }, { "lesssim", "≲" }, { "gtrsim", "≳" }, { "lessapprox", "⪅" }, { "gtrapprox", "⪆" },
         { "supset", "⊃" }, { "supseteq", "⊇" }, { "supsetneq", "⊋" }, { "nsupseteq", "⊉" }, { "cup", "∪" }, { "cap", "∩" }, { "forall", "∀" }, { "exists", "∃" }, { "partial", "∂" }, { "nabla", "∇" },

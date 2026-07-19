@@ -2,7 +2,7 @@
 
 > **免费插件**：Word/WPS 文本、TeX 公式、表格与试卷排版工具。项目更新、下载与问题反馈见 [GitHub 项目主页](https://github.com/Pot0001/AIGFH)。
 
-![Version](https://img.shields.io/badge/version-1.1.1-2563eb)
+![Version](https://img.shields.io/badge/version-1.1.2-2563eb)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078d4)
 ![Office](https://img.shields.io/badge/Office-Word%20%7C%20WPS-d83b01)
 
@@ -12,7 +12,7 @@ AI规范化是 Microsoft Word 与 WPS Office 的本地 COM 加载项，重点帮
 
 ### 教师
 
-- **AI 备课**：复制《使用说明》中的提示词给 AI，将结果粘贴到 Word/WPS，选择“一键规范”，再用“公式核对”快速检查。
+- **AI 备课**：点击“复制 AI 提示词”，粘贴到 AI 并填写任务；将生成结果粘贴到 Word/WPS，选择“一键规范”，再用“公式核对”快速检查。
 - **制作讲义**：使用“讲义版式”统一字体、段落和标题；表格与公式可单独整理。
 - **制作试卷**：选择 A3/A4 与横版/竖版，整理题号、选项、小问、表格和公式。
 - **制作学生版**：在“答案解析”中生成学生版副本，原教师版保持不变；还可隐藏或显示答案解析。
@@ -39,6 +39,7 @@ AI规范化是 Microsoft Word 与 WPS Office 的本地 COM 加载项，重点帮
 - **MathType 互转**：MathType/Equation OLE 与可编辑公式互转；转为 MathType 需要已安装 MathType 加载项。
 - **自定义**：设置正文字体、公式字体、字号、行距、段距、首行缩进、试卷、答题区、表格和一键规范流程。
 - **替换规则**：编辑、导入和导出文本替换规则。
+- **使用说明**：功能区直接打开操作说明；“更多”菜单可一键复制推荐 AI 提示词。
 - **本地处理**：文档处理在本机完成，插件本身不上传文档内容。
 
 ## 数学表达覆盖
@@ -58,7 +59,7 @@ AI规范化是 Microsoft Word 与 WPS Office 的本地 COM 加载项，重点帮
 
 ## 安装
 
-1. 下载并双击 `AI规范化-Pot0001-1.1.1.exe`。
+1. 下载并双击 `AI规范化-Pot0001-1.1.2.exe`。
 2. 安装程序会显示本机版本与安装包版本，并给出适合当前状态的操作。
 3. 完成后关闭全部 Word/WPS 窗口并重新打开。
 4. 在功能区进入 **AI规范化**。
@@ -67,7 +68,7 @@ AI规范化是 Microsoft Word 与 WPS Office 的本地 COM 加载项，重点帮
 
 ## 快速使用
 
-1. 粘贴 AI 内容。
+1. 在功能区打开“使用说明”，或从“更多”菜单复制 AI 提示词；生成内容后粘贴到 Word/WPS。
 2. 点击“范围：全文/选区”切换当前处理范围；使用“选区”前请先选中内容。
 3. 常规内容用“一键规范”；需要分步处理时，先“规范文本”，再“规范公式”。
 4. 试卷使用“试卷排版”；交付前使用“公式核对”和“排版检查”。
@@ -83,7 +84,7 @@ AI规范化是 Microsoft Word 与 WPS Office 的本地 COM 加载项，重点帮
 - 关系与逻辑：集合、量词、关系、箭头、逻辑和同余等常用命令
 - 运算与修饰：积分、求和、极限、常用函数、上下标、重音、上下括号、上下标注
 
-同时兼容 `\dfrac1a`、`\frac12` 等常见紧凑写法。复杂公式转换后可用“公式核对”快速确认。
+同时兼容 `\dfrac1a`、`\frac12` 等常见紧凑写法，并修正网页输出中的 `\lt`、`\gt`。复杂公式转换后可用“公式核对”快速确认。
 
 ## 运行环境
 
@@ -104,7 +105,7 @@ AI规范化是 Microsoft Word 与 WPS Office 的本地 COM 加载项，重点帮
 
 ```text
 bin/Release/AIGFH.dll
-dist/AI规范化-Pot0001-1.1.1.exe
+dist/AI规范化-Pot0001-1.1.2.exe
 ```
 
 ## 项目结构
@@ -120,6 +121,8 @@ SettingsForm.cs              自定义设置界面
 RuleEditorForm.cs            替换规则编辑与导入导出
 FormulaReviewForm.cs         公式转换前预览核对
 UpdateChecker.cs             新版本检查
+AI提示词.txt                 可由功能区直接复制的推荐提示词
+使用说明.txt                 操作流程与格式说明
 Installer/Program.cs         当前用户安装与维护程序
 Resources/RibbonIcons/       功能区图标
 References/                  构建时使用的 Office COM 接口

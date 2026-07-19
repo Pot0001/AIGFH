@@ -353,6 +353,17 @@ public sealed class OfficeDocumentService
         var repaired = RepairExistingOfficeMath(document, range);
         var text = (string)range.Text;
         if (String.IsNullOrWhiteSpace((text ?? String.Empty).Trim('\r', '\a'))) return 0;
+        if (!RangeContainsOfficeMath(range))
+        {
+            var normalizedText = NormalizeWebAiFormulaText(text);
+            if (!String.Equals(text, normalizedText, StringComparison.Ordinal))
+            {
+                var normalizedStart = (int)range.Start;
+                range.Text = normalizedText;
+                range = document.Range(normalizedStart, (int)range.End);
+                text = normalizedText;
+            }
+        }
         var rangeStart = (int)range.Start;
         var rangeEnd = (int)range.End;
         var occupiedMath = (List<Tuple<int, int>>)GetOfficeMathSpans(document, rangeStart, rangeEnd);
@@ -544,7 +555,7 @@ public sealed class OfficeDocumentService
 
     private static bool LooksLikeExamPaper(string text)
     {
-        var value = text ?? String.Empty;
+        var value = NormalizeClipboardCharacters(text ?? String.Empty);
         return (value.Contains("试卷") || value.Contains("考试")) &&
                (value.Contains("注意事项") || value.Contains("选择题")) &&
                Regex.IsMatch(value, @"(?:\A|[\r\n])\s*1[\.．、]\s*");
@@ -1314,11 +1325,18 @@ public sealed class OfficeDocumentService
     private static string NormalizeWebAiFormulaText(string text)
     {
         var value = text ?? String.Empty;
+        // 推荐提示词要求 AI 把完整结果放在一个纯文本代码块中，用户点击代码块
+        // 的复制按钮即可保留全部 TeX 反斜杠。粘贴后先移除最外层包装。
+        value = Regex.Replace(
+            value,
+            @"\A[ \t]*```(?:text|plaintext|markdown|md)?[ \t]*(?:\r\n|\r|\n)(?<body>[\s\S]*?)(?:\r\n|\r|\n)[ \t]*```[ \t\r\n]*\z",
+            "${body}",
+            RegexOptions.IgnoreCase);
         value = value.Replace("\\\\(", "\\(").Replace("\\\\)", "\\)").Replace("\\\\[", "\\[").Replace("\\\\]", "\\]");
         value = value.Replace("反斜杠quad", "\\quad").Replace("反斜杠qquad", "\\qquad");
         value = Regex.Replace(
             value,
-            @"\\\\(?=(?:begin|end|frac|dfrac|tfrac|binom|sqrt|text|textcolor|color|mathrm|mathbf|mathit|mathnormal|mathbb|mathcal|mathfrak|boldsymbol|bm|operatorname|overset|underset|overbrace|underbrace|substack|cancel|bcancel|xcancel|boxed|left|right|sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|lim|limsup|liminf|log|ln|exp|Pr|alpha|beta|gamma|delta|epsilon|theta|lambda|mu|nu|xi|pi|rho|sigma|tau|phi|varphi|omega|sum|prod|int|quad|qquad|cdot|times|leqslant|geqslant|leq|geq|neq|approx|equiv|infty|pm|mp|div|in|notin|subset|supset|cup|cap|forall|exists|partial|nabla|Longrightarrow|Longleftarrow|Longleftrightarrow|Rightarrow|Leftarrow|Leftrightarrow|longrightarrow|longleftarrow|longleftrightarrow|rightarrow|leftarrow|leftrightarrow|implies|iff|mapsto|to|therefore|because|perp|parallel)\b)",
+            @"\\\\(?=(?:begin|end|frac|dfrac|tfrac|binom|sqrt|text|textcolor|color|mathrm|mathbf|mathit|mathnormal|mathbb|mathcal|mathfrak|boldsymbol|bm|operatorname|overset|underset|overbrace|underbrace|substack|cancel|bcancel|xcancel|boxed|left|right|sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|lim|limsup|liminf|log|ln|exp|Pr|alpha|beta|gamma|delta|epsilon|theta|lambda|mu|nu|xi|pi|rho|sigma|tau|phi|varphi|omega|sum|prod|int|quad|qquad|cdot|times|leqslant|geqslant|leq|geq|le|ge|lt|gt|neq|approx|equiv|infty|pm|mp|div|in|notin|subset|supset|cup|cap|forall|exists|partial|nabla|Longrightarrow|Longleftarrow|Longleftrightarrow|Rightarrow|Leftarrow|Leftrightarrow|longrightarrow|longleftarrow|longleftrightarrow|rightarrow|leftarrow|leftrightarrow|implies|iff|mapsto|to|therefore|because|perp|parallel)\b)",
             "\\");
 
         // ChatGPT/GPT 网页复制有时会把 \[...\] 的反斜杠丢掉，并把等号
@@ -2401,7 +2419,7 @@ public sealed class OfficeDocumentService
     {
         return Regex.Matches(
             source,
-            @"\$\$(?<display>.+?)\$\$|(?<!\\)(?<!\$)\$(?!\$)(?<dollar>[^\r\n]+?)(?<!\\)\$(?!\$)|\\{1,2}\((?<paren>[^\r\n]+?)\\{1,2}\)|(?<!\\)\((?<gptparen>\\(?:frac|dfrac|tfrac|cfrac|sqrt|vec|overline|widehat|sin|cos|tan|cot|sec|csc|alpha|beta|gamma|delta|theta|lambda|mu|pi|sum|prod|int|lim|det|Pr)[^\r\n]*?)\)|\\{1,2}\[(?<bracket>.+?)\\{1,2}\]|```(?:latex|tex|math)?[ \t]*\r?\n(?<fence>.+?)\r?\n```|(?<environment>\\begin\s*\{(?<envname>math|displaymath|equation\*?|align\*?|aligned|alignedat|alignat\*?|flalign\*?|gather\*?|gathered|multline\*?|multlined|split|cases|dcases|array|matrix|smallmatrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix)\}.*?\\end\s*\{\k<envname>\})|(?:\A|(?<=\r))[ \t]*\\?\[[ \t]*\r(?<block>.+?)\r[ \t]*\\?\][ \t]*(?=\r|\z)|(?:\A|(?<=\r))[ \t]*(?<line>\\(?:begin|sin|cos|tan|cot|sec|csc|frac|dfrac|tfrac|cfrac|sqrt|vec|overline|widehat|text|operatorname|mathbb|alpha|beta|gamma|delta|theta|lambda|mu|pi|sum|prod|int|iint|iiint|oint|lim|det|Pr)(?=\b|\d|\{|\s)[^\r\n]*)[ \t]*(?=\r|\z)",
+            @"\$\$(?<display>.+?)\$\$|(?<!\\)(?<!\$)\$(?!\$)(?<dollar>[^\r\n]+?)(?<!\\)\$(?!\$)|\\{1,2}\((?<paren>[^\r\n]+?)\\{1,2}\)|\\{1,2}\[(?<bracket>.+?)\\{1,2}\]|```(?:latex|tex|math)?[ \t]*(?:\r\n|\r|\n)(?<fence>.+?)(?:\r\n|\r|\n)```|(?<environment>\\begin\s*\{(?<envname>math|displaymath|equation\*?|align\*?|aligned|alignedat|alignat\*?|flalign\*?|gather\*?|gathered|multline\*?|multlined|split|cases|dcases|array|matrix|smallmatrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix)\}.*?\\end\s*\{\k<envname>\})|(?:\A|(?<=\r)|(?<=\n))[ \t]*\\?\[[ \t]*(?:\r\n|\r|\n)(?<block>.+?)(?:\r\n|\r|\n)[ \t]*\\?\][ \t]*(?=\r|\n|\z)|(?:\A|(?<=\r)|(?<=\n))[ \t]*(?<line>\\(?:begin|sin|cos|tan|cot|sec|csc|frac|dfrac|tfrac|cfrac|sqrt|vec|overline|widehat|text|operatorname|mathbb|alpha|beta|gamma|delta|theta|lambda|mu|pi|sum|prod|int|iint|iiint|oint|lim|det|Pr)(?=\b|\d|\{|\s)[^\r\n]*)[ \t]*(?=\r|\n|\z)",
             RegexOptions.Singleline);
     }
 
@@ -2412,9 +2430,9 @@ public sealed class OfficeDocumentService
         var occupied = new List<Tuple<int, int>>();
         foreach (Match match in FindAiLatexMatches(source))
         {
-            var formula = FirstSuccessfulGroup(match, "display", "dollar", "paren", "gptparen", "bracket", "fence", "environment", "block", "line").Trim();
+            var formula = FirstSuccessfulGroup(match, "display", "dollar", "paren", "bracket", "fence", "environment", "block", "line").Trim();
             if (formula.Length == 0) continue;
-            var explicitInline = match.Groups["dollar"].Success || match.Groups["paren"].Success || match.Groups["gptparen"].Success;
+            var explicitInline = match.Groups["dollar"].Success || match.Groups["paren"].Success;
             var display = match.Groups["display"].Success || match.Groups["bracket"].Success ||
                           match.Groups["fence"].Success || match.Groups["environment"].Success ||
                           match.Groups["block"].Success || match.Groups["line"].Success ||
@@ -2430,11 +2448,21 @@ public sealed class OfficeDocumentService
             occupied.Add(Tuple.Create(match.Index, match.Index + match.Length));
         }
 
+        // 网页复制偶尔会把 \(...\) 两侧的反斜杠去掉，形成
+        // “(\beta(a))”或“(\lim_{x\to0}f(g(x)))”。用括号深度扫描恢复，
+        // 避免正则在第一个内部右括号处截断公式。
+        foreach (var candidate in FindBalancedGptParenthesizedFormulas(source))
+        {
+            if (occupied.Any(span => candidate.Index < span.Item2 && candidate.Index + candidate.Length > span.Item1)) continue;
+            result.Add(candidate);
+            occupied.Add(Tuple.Create(candidate.Index, candidate.Index + candidate.Length));
+        }
+
         // AI 页面偶尔会丢失公式的起始定界符，例如
         // “同理 a<-\dfrac13\)。”。强 TeX 命令仍能可靠表明这是公式，
         // 因此只补捉包含这类命令的局部片段，不把整段普通文字改成公式。
         var strongCommands = Regex.Matches(source,
-            @"\\(?:dfrac|tfrac|cfrac|frac|sqrt|binom|sum|prod|coprod|bigcup|bigcap|int|iint|iiint|oint|oiint|lim|sin|cos|tan|cot|sec|csc|sinh|cosh|log|ln|exp|det|rank|ker|Pr|vec|overrightarrow|xrightarrow|xleftarrow|overline|widehat|mathbb|alpha|beta|gamma|delta|epsilon|varepsilon|theta|lambda|mu|pi|varphi|phi|triangle|emptyset|varnothing|underline|operatorname)(?=\b|\d|\{|\s)",
+            @"\\(?:dfrac|tfrac|cfrac|frac|sqrt|binom|sum|prod|coprod|bigcup|bigcap|int|iint|iiint|oint|oiint|lim|sin|cos|tan|cot|sec|csc|sinh|cosh|log|ln|exp|det|rank|ker|Pr|vec|overrightarrow|xrightarrow|xleftarrow|overline|widehat|mathbb|alpha|beta|gamma|delta|epsilon|varepsilon|theta|lambda|mu|pi|varphi|phi|triangle|emptyset|varnothing|underline|operatorname|lt|gt)(?=\b|\d|\{|\s)",
             RegexOptions.IgnoreCase);
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (Match command in strongCommands)
@@ -2474,6 +2502,41 @@ public sealed class OfficeDocumentService
         return result.OrderBy(item => item.Index).ThenByDescending(item => item.Length).ToList();
     }
 
+    private static IEnumerable<AiFormulaCandidate> FindBalancedGptParenthesizedFormulas(string source)
+    {
+        const string commandPattern = @"\A\\(?:frac|dfrac|tfrac|cfrac|sqrt|vec|overline|widehat|sin|cos|tan|cot|sec|csc|sinh|cosh|tanh|alpha|beta|gamma|delta|theta|lambda|mu|pi|sum|prod|int|iint|iiint|lim|det|Pr|mathbb|operatorname)(?![A-Za-z])";
+        for (var start = 0; start < source.Length; start++)
+        {
+            if (source[start] != '(' || start > 0 && source[start - 1] == '\\') continue;
+            var contentStart = start + 1;
+            while (contentStart < source.Length && (source[contentStart] == ' ' || source[contentStart] == '\t')) contentStart++;
+            if (!Regex.IsMatch(source.Substring(contentStart), commandPattern, RegexOptions.IgnoreCase)) continue;
+
+            var depth = 1;
+            var end = -1;
+            for (var cursor = start + 1; cursor < source.Length; cursor++)
+            {
+                var character = source[cursor];
+                if (character == '\r' || character == '\n' || character == '\a') break;
+                if (character == '(') depth++;
+                else if (character == ')' && --depth == 0) { end = cursor; break; }
+            }
+            if (end <= contentStart) continue;
+
+            var formula = source.Substring(start + 1, end - start - 1).Trim();
+            if (formula.Length == 0) continue;
+            yield return new AiFormulaCandidate
+            {
+                Index = start,
+                Length = end - start + 1,
+                Source = source.Substring(start, end - start + 1),
+                Formula = formula,
+                Display = false
+            };
+            start = end;
+        }
+    }
+
     private static bool IsReliableBareFormula(string formula, bool wholeLine, bool hasOrphanClosingDelimiter)
     {
         if (String.IsNullOrWhiteSpace(formula)) return false;
@@ -2494,7 +2557,7 @@ public sealed class OfficeDocumentService
         if (wholeLine) return true;
         // 行内无定界符公式至少需要一个完整的结构命令或明显的等式/不等式，
         // 避免把普通句子里的单个希腊字母命令误识别成整段公式。
-        return Regex.IsMatch(formula, @"\\(?:dfrac|tfrac|cfrac|frac|sqrt|binom|vec|overrightarrow|overline|widehat|sum|prod|int|iint|iiint|oint|det|mathbb)\b|[=<>]",
+        return Regex.IsMatch(formula, @"\\(?:dfrac|tfrac|cfrac|frac|sqrt|binom|vec|overrightarrow|overline|widehat|sum|prod|int|iint|iiint|oint|det|mathbb|lt|gt|le|ge|leq|geq|ne|neq)\b|[=<>]",
             RegexOptions.IgnoreCase);
     }
 
@@ -2521,7 +2584,12 @@ public sealed class OfficeDocumentService
 
     private static string NormalizeLatexInput(string source)
     {
-        var value = NormalizeBareFormulaBoundary(source);
+        var value = NormalizeBareFormulaBoundary(NormalizeClipboardCharacters(source));
+        value = value.Replace("&lt;", "<").Replace("&gt;", ">").Replace("&le;", "≤").Replace("&ge;", "≥");
+        // MathJax 接受 \lt/\gt，但 Word 与部分 WPS 公式引擎会把它们显示为原文。
+        // 在选择渲染路径前统一为标准关系符，确保行内、行间和矩阵都一致。
+        value = Regex.Replace(value, @"\\lt(?![A-Za-z])", "<");
+        value = Regex.Replace(value, @"\\gt(?![A-Za-z])", ">");
         // 浏览器复制时偶尔会给普通运算符多加一个反斜杠，例如 \<、\-。
         value = Regex.Replace(value, @"\\(?=[<>=+\-*/])", String.Empty);
         value = Regex.Replace(value, @"([<>])\s*-\s*(?=[\\\d(])", "$1 -");
@@ -2535,8 +2603,32 @@ public sealed class OfficeDocumentService
             String.Empty);
         value = value.Replace("\\dfrac", "\\frac").Replace("\\tfrac", "\\frac");
         value = value.Replace("\\operatorname*", "\\operatorname");
+        value = RepairSingleLatexRowSeparators(value);
         value = NormalizeBareFractionSyntax(value);
         return value.Trim();
+    }
+
+    private static string NormalizeClipboardCharacters(string source)
+    {
+        return (source ?? String.Empty)
+            .Replace("\u200B", String.Empty)
+            .Replace("\u200C", String.Empty)
+            .Replace("\u200D", String.Empty)
+            .Replace("\u2060", String.Empty)
+            .Replace("\uFEFF", String.Empty)
+            .Replace('\u00A0', ' ')
+            .Replace('\u202F', ' ')
+            .Replace('\uFF3C', '\\');
+    }
+
+    private static string RepairSingleLatexRowSeparators(string source)
+    {
+        return Regex.Replace(source ?? String.Empty,
+            @"(?s)(?<open>\\begin\s*\{(?<name>align\*?|aligned|alignedat|alignat\*?|flalign\*?|gather\*?|gathered|multline\*?|multlined|split|cases|dcases|array|matrix|smallmatrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix)\})(?<body>.*?)(?<close>\\end\s*\{\k<name>\})",
+            match => match.Groups["open"].Value +
+                     Regex.Replace(match.Groups["body"].Value, @"(?<!\\)\\[ \t]*(?=\r\n|\r|\n)", "\\\\") +
+                     match.Groups["close"].Value,
+            RegexOptions.IgnoreCase);
     }
 
     private static string RemoveUnmatchedLatexBraces(string source)
@@ -2967,7 +3059,7 @@ public sealed class OfficeDocumentService
         value = value.Replace("\\cdots", "\u22ef").Replace("\\ldots", "\u2026").Replace("\\dots", "\u2026");
         value = ReplaceAdditionalLatexSymbols(value);
         value = value.Replace("\\leqslant", "\u2264").Replace("\\geqslant", "\u2265").Replace("\\subsetneq", "\u228a").Replace("\\supsetneq", "\u228b");
-        value = value.Replace("\\times", "\u00d7").Replace("\\cdot", "\u00b7").Replace("\\leq", "\u2264").Replace("\\geq", "\u2265").Replace("\\le", "\u2264").Replace("\\ge", "\u2265").Replace("\\neq", "\u2260").Replace("\\ne", "\u2260");
+        value = value.Replace("\\times", "\u00d7").Replace("\\cdot", "\u00b7").Replace("\\leq", "\u2264").Replace("\\geq", "\u2265").Replace("\\le", "\u2264").Replace("\\ge", "\u2265").Replace("\\lt", "<").Replace("\\gt", ">").Replace("\\neq", "\u2260").Replace("\\ne", "\u2260");
         value = value.Replace("\\sim", "\u223c").Replace("\\circ", "\u2218").Replace("\\complement", "\u2201");
         value = value.Replace("\\approx", "\u2248").Replace("\\equiv", "\u2261").Replace("\\infty", "\u221e").Replace("\\pm", "\u00b1").Replace("\\mp", "\u2213").Replace("\\div", "\u00f7");
         value = value.Replace("\\in", "\u2208").Replace("\\notin", "\u2209").Replace("\\subseteq", "\u2286").Replace("\\supseteq", "\u2287").Replace("\\subset", "\u2282").Replace("\\supset", "\u2283");

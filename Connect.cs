@@ -113,14 +113,16 @@ public sealed class Connect : IRibbonCallbacks, IDTExtensibility2, IRibbonExtens
         </group>
         <group id=""AIGFH.Settings"" label=""设置"">
           <button id=""OpenSettings"" label=""自定义"" getImage=""GetRibbonImage"" size=""large"" onAction=""OnRibbonButton"" />
+          <button id=""OpenUserGuide"" label=""使用说明"" screentip=""查看操作方法和 AI 提示词"" supertip=""打开使用说明，查看常用流程、公式格式和推荐提示词。"" getImage=""GetRibbonImage"" size=""large"" onAction=""OnRibbonButton"" />
           <button id=""DocumentCheck"" label=""排版检查"" screentip=""检查当前文档"" supertip=""统计待转换公式、排版标记和公式定界符问题。"" getImage=""GetRibbonImage"" onAction=""OnRibbonButton"" />
           <menu id=""MoreSettings"" label=""更多"" screentip=""规则、运行检查与帮助"" getImage=""GetRibbonImage"" itemSize=""large"">
             <button id=""OpenRuleEditor"" label=""替换规则"" onAction=""OnRibbonButton"" />
             <button id=""CompatibilityCheck"" label=""运行检查"" screentip=""检查 Word/WPS 功能"" onAction=""OnRibbonButton"" />
             <button id=""CheckUpdates"" label=""检查更新"" onAction=""OnRibbonButton"" />
+            <button id=""CopyAiPrompt"" label=""复制 AI 提示词"" screentip=""复制推荐提示词"" supertip=""复制后粘贴到 AI，并在末尾填写具体任务。"" onAction=""OnRibbonButton"" />
             <button id=""OpenProjectHome"" label=""关于与反馈"" onAction=""OnRibbonButton"" />
           </menu>
-          <labelControl id=""VersionLabel"" label=""版本：1.1.1"" />
+          <labelControl id=""VersionLabel"" label=""版本：1.1.2"" />
         </group>
       </tab>
     </tabs>
@@ -227,6 +229,8 @@ public sealed class Connect : IRibbonCallbacks, IDTExtensibility2, IRibbonExtens
                     break;
                 }
                 case "OpenSettings": using (var form = new SettingsForm(settings)) if (form.ShowDialog() == System.Windows.Forms.DialogResult.OK) SetStatus("自定义设置已保存。"); break;
+                case "OpenUserGuide": OpenUserGuide(); break;
+                case "CopyAiPrompt": CopyAiPrompt(); SetStatus("AI 提示词已复制，请粘贴到 AI 并在末尾填写任务。"); break;
                 case "OpenRuleEditor": using (var form = new RuleEditorForm(settings, service)) form.ShowDialog(); break;
                 case "CompatibilityCheck": ShowTextReport("运行检查", service.GetCompatibilityReport()); break;
                 case "DocumentCheck": ShowTextReport("排版检查", service.GetDocumentCheckReport()); break;
@@ -404,6 +408,36 @@ public sealed class Connect : IRibbonCallbacks, IDTExtensibility2, IRibbonExtens
             form.CancelButton = close;
             form.ShowDialog();
         }
+    }
+
+    private static void OpenUserGuide()
+    {
+        var directory = Path.GetDirectoryName(typeof(Connect).Assembly.Location) ?? String.Empty;
+        var guidePath = Path.Combine(directory, "使用说明.txt");
+        if (!File.Exists(guidePath))
+        {
+            var installedPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AIGFH",
+                UpdateChecker.CurrentVersion,
+                "使用说明.txt");
+            if (File.Exists(installedPath)) guidePath = installedPath;
+        }
+
+        if (!File.Exists(guidePath))
+            throw new FileNotFoundException("使用说明尚未安装，请重新运行当前版本安装包。", guidePath);
+        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(guidePath) { UseShellExecute = true });
+    }
+
+    private static void CopyAiPrompt()
+    {
+        var directory = Path.GetDirectoryName(typeof(Connect).Assembly.Location) ?? String.Empty;
+        var promptPath = Path.Combine(directory, "AI提示词.txt");
+        if (!File.Exists(promptPath))
+            throw new FileNotFoundException("AI 提示词尚未安装，请重新运行当前版本安装包。", promptPath);
+        var prompt = File.ReadAllText(promptPath, System.Text.Encoding.UTF8).Trim();
+        if (prompt.Length == 0) throw new InvalidDataException("AI 提示词内容为空，请重新运行当前版本安装包。");
+        System.Windows.Forms.Clipboard.SetText(prompt);
     }
 
     private static void ShowTextReport(string title, string report)
