@@ -1240,7 +1240,10 @@ public sealed class OfficeDocumentService
         if (String.Equals(scope, "Document", StringComparison.OrdinalIgnoreCase)) return document.Content;
         if (String.Equals(scope, "Selection", StringComparison.OrdinalIgnoreCase))
         {
-            if (String.IsNullOrWhiteSpace((selectedText ?? String.Empty).Trim('\r', '\a'))) throw new InvalidOperationException("请先选中需要规范的文本。");
+            // 公式、表格、域和部分 WPS 对象的 Range.Text 可能为空，但范围坐标
+            // 仍然有效。选区模式应以 Start/End 为准，后续步骤各自判断内容。
+            if ((int)selected.End <= (int)selected.Start)
+                throw new InvalidOperationException("请先选中需要规范的内容。");
             return selected;
         }
         if (!String.IsNullOrWhiteSpace((selectedText ?? String.Empty).Trim('\r', '\a'))) return selected;
@@ -1270,8 +1273,7 @@ public sealed class OfficeDocumentService
         try
         {
             dynamic range = ((dynamic)_application).Selection.Range;
-            var text = range.Text as string;
-            return !String.IsNullOrWhiteSpace((text ?? String.Empty).Trim('\r', '\a'));
+            return (int)range.End > (int)range.Start;
         }
         catch { return false; }
     }

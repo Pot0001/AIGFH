@@ -24,12 +24,14 @@ public interface IRibbonCallbacks
     object GetRibbonImage([MarshalAs(UnmanagedType.IDispatch)] object control);
 
     [DispId(4)]
-    void OnScopeToggle([MarshalAs(UnmanagedType.IDispatch)] object control, bool pressed);
+    void OnScopeToggle([MarshalAs(UnmanagedType.IDispatch)] object control,
+        [MarshalAs(UnmanagedType.VariantBool)] bool pressed);
 
     [DispId(5)]
     string GetScopeLabel([MarshalAs(UnmanagedType.IDispatch)] object control);
 
     [DispId(6)]
+    [return: MarshalAs(UnmanagedType.VariantBool)]
     bool GetScopePressed([MarshalAs(UnmanagedType.IDispatch)] object control);
 }
 
@@ -42,6 +44,10 @@ public sealed class Connect : IRibbonCallbacks, IDTExtensibility2, IRibbonExtens
 {
     private object _application;
     private object _ribbon;
+    private int _lastSelectionStart = -1;
+    private int _lastSelectionEnd = -1;
+    private string _lastSelectionDocument = String.Empty;
+    private DateTime _lastSelectionTime = DateTime.MinValue;
 
     public void OnConnection(object application, ext_ConnectMode connectMode, object addInInst, ref Array custom)
     {
@@ -122,7 +128,7 @@ public sealed class Connect : IRibbonCallbacks, IDTExtensibility2, IRibbonExtens
             <button id=""CopyAiPrompt"" label=""复制 AI 提示词"" screentip=""复制推荐提示词"" supertip=""复制后粘贴到 AI，并在末尾填写具体任务。"" onAction=""OnRibbonButton"" />
             <button id=""OpenProjectHome"" label=""关于与反馈"" onAction=""OnRibbonButton"" />
           </menu>
-          <labelControl id=""VersionLabel"" label=""版本：1.1.6"" />
+          <labelControl id=""VersionLabel"" label=""版本：1.1.7"" />
         </group>
       </tab>
     </tabs>
@@ -137,6 +143,7 @@ public sealed class Connect : IRibbonCallbacks, IDTExtensibility2, IRibbonExtens
 
     public void OnScopeToggle(object control, bool pressed)
     {
+        if (pressed) CaptureCurrentSelection();
         var settings = NormalizationSettings.Load();
         settings.ProcessingScope = pressed ? "Selection" : "Document";
         settings.Save();
@@ -169,11 +176,17 @@ public sealed class Connect : IRibbonCallbacks, IDTExtensibility2, IRibbonExtens
 
     public void OnRibbonButton(object control)
     {
+        // Word/WPS 某些版本在焦点从正文切到功能区时会临时折叠选区。
+        // 在读取控件和配置前先记住坐标，随后按“选区”模式恢复。
+        CaptureCurrentSelection();
         var service = new OfficeDocumentService(_application);
         var settings = NormalizationSettings.Load();
         try
         {
             var controlId = GetRibbonControlId(control);
+            if (IsForcedSelectionAction(controlId)) settings.ProcessingScope = "Selection";
+            else if (IsForcedDocumentAction(controlId)) settings.ProcessingScope = "Document";
+            RestoreCapturedSelection(settings.ProcessingScope);
             switch (controlId)
             {
                 case "NormalizeAllAiFormula": SetFormulaStatus(service.NormalizeUnifiedAiFormulas(settings), ScopeName(settings)); break;
@@ -247,13 +260,13 @@ public sealed class Connect : IRibbonCallbacks, IDTExtensibility2, IRibbonExtens
                     var formulas = 0;
                     var tables = 0;
                     var skipped = new List<string>();
-                    if (settings.AutoRunText) RunAutoStep("文本", () => textChanged = service.NormalizeUnifiedAiText(settings), skipped);
+                    if (settings.AutoRunText) RunScopedAutoStep("文本", settings, () => textChanged = service.NormalizeUnifiedAiText(settings), skipped);
                     if (settings.AutoRunFormula || settings.AutoRunConvert)
-                        RunAutoStep("公式", () => formulas += service.NormalizeUnifiedAiFormulas(settings), skipped);
-                    if (settings.AutoRunTables) RunAutoStep("表格", () => { tables += service.RestoreMarkdownTables(settings.ThreeLineTables, settings.AutoFitTables, false, settings.ProcessingScope); tables += service.SmartCleanTables(settings.AutoFitTables, settings.ThreeLineTables, settings.ProcessingScope); }, skipped);
-                    if (settings.AutoRunSpaces) RunAutoStep("空格与空行", () => { service.CollapseRepeatedSpaces(settings.ProcessingScope); service.NormalizeBlankLines(settings.ProcessingScope); }, skipped);
-                    if (settings.AutoRunFont) RunAutoStep("公式字体", () => service.ApplyFormulaFont(settings.FormulaFontName, settings.ProcessingScope), skipped);
-                    if (settings.ApplyPresetAfterNormalize) RunAutoStep("讲义版式", () => { service.ApplyPreset(settings.FontName, settings.FontSize, 3, settings.FirstLineIndent, settings.ParagraphSpaceAfter > 0, settings.LineSpacing, settings.ParagraphSpaceAfter, settings.ProcessingScope); service.ApplyFormulaFont(settings.FormulaFontName, settings.ProcessingScope); }, skipped);
+                        RunScopedAutoStep("公式", settings, () => formulas += service.NormalizeUnifiedAiFormulas(settings), skipped);
+                    if (settings.AutoRunTables) RunScopedAutoStep("表格", settings, () => { tables += service.RestoreMarkdownTables(settings.ThreeLineTables, settings.AutoFitTables, false, settings.ProcessingScope); tables += service.SmartCleanTables(settings.AutoFitTables, settings.ThreeLineTables, settings.ProcessingScope); }, skipped);
+                    if (settings.AutoRunSpaces) RunScopedAutoStep("空格与空行", settings, () => { service.CollapseRepeatedSpaces(settings.ProcessingScope); service.NormalizeBlankLines(settings.ProcessingScope); }, skipped);
+                    if (settings.AutoRunFont) RunScopedAutoStep("公式字体", settings, () => service.ApplyFormulaFont(settings.FormulaFontName, settings.ProcessingScope), skipped);
+                    if (settings.ApplyPresetAfterNormalize) RunScopedAutoStep("讲义版式", settings, () => { service.ApplyPreset(settings.FontName, settings.FontSize, 3, settings.FirstLineIndent, settings.ParagraphSpaceAfter > 0, settings.LineSpacing, settings.ParagraphSpaceAfter, settings.ProcessingScope); service.ApplyFormulaFont(settings.FormulaFontName, settings.ProcessingScope); }, skipped);
                     var result = ScopeName(settings) + "规范完成。" + (textChanged > 0 ? "文本已整理，" : String.Empty) + "公式 " + formulas + " 个，表格 " + tables + " 项。";
                     SetStatus(skipped.Count == 0
                         ? result
@@ -279,10 +292,76 @@ public sealed class Connect : IRibbonCallbacks, IDTExtensibility2, IRibbonExtens
         return String.Empty;
     }
 
+    private void CaptureCurrentSelection()
+    {
+        try
+        {
+            dynamic application = _application;
+            dynamic selection = application.Selection;
+            dynamic range = selection.Range;
+            var start = (int)range.Start;
+            var end = (int)range.End;
+            if (end <= start) return;
+            _lastSelectionStart = start;
+            _lastSelectionEnd = end;
+            try { _lastSelectionDocument = Convert.ToString(application.ActiveDocument.Name); }
+            catch { _lastSelectionDocument = String.Empty; }
+            _lastSelectionTime = DateTime.UtcNow;
+        }
+        catch { }
+    }
+
+    private void RestoreCapturedSelection(string scope)
+    {
+        if (!String.Equals(scope, "Selection", StringComparison.OrdinalIgnoreCase)) return;
+        try
+        {
+            dynamic application = _application;
+            dynamic current = application.Selection.Range;
+            if ((int)current.End > (int)current.Start) return;
+            if (_lastSelectionStart < 0 || _lastSelectionEnd <= _lastSelectionStart ||
+                DateTime.UtcNow - _lastSelectionTime > TimeSpan.FromSeconds(15)) return;
+            dynamic document = application.ActiveDocument;
+            var name = Convert.ToString(document.Name);
+            if (!String.IsNullOrEmpty(_lastSelectionDocument) &&
+                !String.Equals(name, _lastSelectionDocument, StringComparison.Ordinal)) return;
+            var documentEnd = (int)document.Content.End;
+            var start = Math.Max((int)document.Content.Start, Math.Min(_lastSelectionStart, documentEnd));
+            var end = Math.Max(start, Math.Min(_lastSelectionEnd, documentEnd));
+            if (end > start) document.Range(start, end).Select();
+        }
+        catch { }
+    }
+
+    private static bool IsForcedSelectionAction(string controlId)
+    {
+        return String.Equals(controlId, "RunAllSelection", StringComparison.Ordinal) ||
+               String.Equals(controlId, "NormalizeFormulaSelection", StringComparison.Ordinal) ||
+               String.Equals(controlId, "NormalizeTextSelection", StringComparison.Ordinal) ||
+               String.Equals(controlId, "BlackSelection", StringComparison.Ordinal);
+    }
+
+    private static bool IsForcedDocumentAction(string controlId)
+    {
+        return String.Equals(controlId, "RunAllDocument", StringComparison.Ordinal) ||
+               String.Equals(controlId, "NormalizeFormulaDocument", StringComparison.Ordinal) ||
+               String.Equals(controlId, "NormalizeTextDocument", StringComparison.Ordinal) ||
+               String.Equals(controlId, "BlackDocument", StringComparison.Ordinal) ||
+               (controlId ?? String.Empty).StartsWith("NormalizeExam", StringComparison.Ordinal);
+    }
+
     private static void RunAutoStep(string name, Action action, ICollection<string> skipped)
     {
         try { action(); }
         catch { skipped.Add(name); }
+    }
+
+    private void RunScopedAutoStep(string name, NormalizationSettings settings, Action action,
+        ICollection<string> skipped)
+    {
+        RestoreCapturedSelection(settings == null ? "Document" : settings.ProcessingScope);
+        RunAutoStep(name, action, skipped);
+        CaptureCurrentSelection();
     }
 
     private static string ScopeName(NormalizationSettings settings)
