@@ -2,7 +2,7 @@
 
 > **免费插件**：Word/WPS 文本、TeX 公式、表格与试卷排版工具。项目更新、下载与问题反馈见 [GitHub 项目主页](https://github.com/Pot0001/AIGFH)。
 
-![Version](https://img.shields.io/badge/version-1.1.5-2563eb)
+![Version](https://img.shields.io/badge/version-1.1.6-2563eb)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078d4)
 ![Office](https://img.shields.io/badge/Office-Word%20%7C%20WPS-d83b01)
 
@@ -59,7 +59,7 @@ AI规范化是 Microsoft Word 与 WPS Office 的本地 COM 加载项，重点帮
 
 ## 安装
 
-1. 下载并双击 `AI规范化-Pot0001-1.1.5.exe`。
+1. 下载并双击 `AI规范化-Pot0001-1.1.6.exe`。
 2. 安装程序会显示本机版本与安装包版本，并给出适合当前状态的操作。
 3. 完成后关闭全部 Word/WPS 窗口并重新打开。
 4. 在功能区进入 **AI规范化**。
@@ -107,7 +107,7 @@ Windows 10 的 WPS 中未出现插件时，请完全退出 WPS，再次打开同
 
 ```text
 bin/Release/AIGFH.dll
-dist/AI规范化-Pot0001-1.1.5.exe
+dist/AI规范化-Pot0001-1.1.6.exe
 ```
 
 ## 项目结构

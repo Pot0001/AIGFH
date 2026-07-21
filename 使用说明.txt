@@ -1,4 +1,4 @@
-AI规范化 v1.1.5 使用说明
+AI规范化 v1.1.6 使用说明
 Word/WPS 文本、TeX 公式、表格与试卷排版工具
 本插件免费提供。项目更新、下载与问题反馈：https://github.com/Pot0001/AIGFH
 

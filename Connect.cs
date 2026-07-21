@@ -122,7 +122,7 @@ public sealed class Connect : IRibbonCallbacks, IDTExtensibility2, IRibbonExtens
             <button id=""CopyAiPrompt"" label=""复制 AI 提示词"" screentip=""复制推荐提示词"" supertip=""复制后粘贴到 AI，并在末尾填写具体任务。"" onAction=""OnRibbonButton"" />
             <button id=""OpenProjectHome"" label=""关于与反馈"" onAction=""OnRibbonButton"" />
           </menu>
-          <labelControl id=""VersionLabel"" label=""版本：1.1.5"" />
+          <labelControl id=""VersionLabel"" label=""版本：1.1.6"" />
         </group>
       </tab>
     </tabs>

@@ -252,6 +252,7 @@ public sealed class OfficeDocumentService
                 changed += RemoveOuterMarkdownFenceInPlace(document, range);
             }
             changed += NormalizeMarkdownInPlace(document, range);
+            NormalizeNumberedListBodyStyles(range);
             FinishAiWebLayout(document, (int)range.Start, (int)range.End);
             SelectScopeRange(range, settings.ProcessingScope);
             return changed > 0 ? 1 : 0;
@@ -268,6 +269,7 @@ public sealed class OfficeDocumentService
         // Reuse the adjusted COM range end instead of the source string length.
         range = document.Range(start, (int)range.End);
         range = RenderMarkdownRangeAsWeb(document, range, true, settings);
+        NormalizeNumberedListBodyStyles(range);
         FinishAiWebLayout(document, (int)range.Start, (int)range.End);
         SelectScopeRange(range, settings.ProcessingScope);
         return 1;
@@ -1930,22 +1932,55 @@ public sealed class OfficeDocumentService
 
     private static void ResetWpsParagraphLayout(dynamic range)
     {
-        try
+        // 网页复制可能把后续编号段落一并带成“标题”样式。先统一恢复正文
+        // 样式，再由 Markdown 标题流程只给带 # 的段落设置标题外观。
+        try { range.Style = -1; }
+        catch
         {
-            dynamic format = range.ParagraphFormat;
-            format.Alignment = 0;
-            format.LeftIndent = 0f;
-            format.RightIndent = 0f;
-            format.FirstLineIndent = 0f;
-            format.SpaceBefore = 0f;
-            format.SpaceAfter = 4f;
-            format.LineSpacingRule = 0;
-            format.KeepTogether = 0;
-            format.KeepWithNext = 0;
-            format.PageBreakBefore = 0;
-            format.WidowControl = -1;
+            try { range.Style = "正文"; }
+            catch { try { range.Style = "Normal"; } catch { } }
         }
-        catch { }
+        dynamic format;
+        try { format = range.ParagraphFormat; }
+        catch { return; }
+        try { format.OutlineLevel = 10; } catch { }
+        try { format.Alignment = 0; } catch { }
+        try { format.LeftIndent = 0f; } catch { }
+        try { format.RightIndent = 0f; } catch { }
+        try { format.FirstLineIndent = 0f; } catch { }
+        try { format.SpaceBefore = 0f; } catch { }
+        try { format.SpaceAfter = 4f; } catch { }
+        try { format.LineSpacingRule = 0; } catch { }
+        try { format.KeepTogether = 0; } catch { }
+        try { format.KeepWithNext = 0; } catch { }
+        try { format.PageBreakBefore = 0; } catch { }
+        try { format.WidowControl = -1; } catch { }
+    }
+
+    private static void NormalizeNumberedListBodyStyles(dynamic range)
+    {
+        var count = SafeCollectionCount(range.Paragraphs);
+        for (var index = 1; index <= count; index++)
+        {
+            try
+            {
+                dynamic paragraphRange = range.Paragraphs[index].Range;
+                var text = (Convert.ToString(paragraphRange.Text) ?? String.Empty)
+                    .Trim('\r', '\n', '\a', ' ', '\t');
+                if (!Regex.IsMatch(text,
+                    @"^(?:(?:\d{1,3}[\.．、\)])|(?:[（(]\d{1,3}[)）]))[ \t]+\S")) continue;
+                try { paragraphRange.Style = -1; }
+                catch
+                {
+                    try { paragraphRange.Style = "正文"; }
+                    catch { try { paragraphRange.Style = "Normal"; } catch { } }
+                }
+                try { paragraphRange.ParagraphFormat.OutlineLevel = 10; } catch { }
+                try { paragraphRange.ParagraphFormat.KeepWithNext = 0; } catch { }
+                try { paragraphRange.ParagraphFormat.PageBreakBefore = 0; } catch { }
+            }
+            catch { }
+        }
     }
 
     private static void ResetWpsTextStyle(dynamic range, NormalizationSettings settings)
