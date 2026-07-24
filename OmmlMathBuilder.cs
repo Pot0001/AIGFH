@@ -502,7 +502,7 @@ internal static class OmmlMathBuilder
     }
 
     private static readonly HashSet<string> Functions = new HashSet<string>(StringComparer.Ordinal)
-    { "sin", "cos", "tan", "cot", "sec", "csc", "sinh", "cosh", "tanh", "coth", "arcsin", "arccos", "arctan", "lim", "limsup", "liminf", "log", "ln", "exp", "min", "max", "sup", "inf", "det", "gcd", "lcm", "rank", "tr", "diag", "ker", "dim", "span", "sgn", "arg", "Pr", "Var", "Cov" };
+    { "sin", "cos", "tan", "cot", "sec", "csc", "sinh", "cosh", "tanh", "coth", "arcsin", "arccos", "arctan", "arcsec", "arccsc", "arccot", "lim", "limsup", "liminf", "log", "lg", "lb", "ln", "exp", "min", "max", "sup", "inf", "det", "gcd", "lcm", "rank", "tr", "diag", "ker", "dim", "span", "sgn", "arg", "Pr", "Var", "Cov" };
 
     private static readonly Dictionary<string, string> Delimiters = new Dictionary<string, string>(StringComparer.Ordinal)
     { { "{", "{" }, { "}", "}" }, { "lbrace", "{" }, { "rbrace", "}" }, { "langle", "〈" }, { "rangle", "〉" }, { "lvert", "|" }, { "rvert", "|" }, { "lVert", "‖" }, { "rVert", "‖" }, { "lfloor", "⌊" }, { "rfloor", "⌋" }, { "lceil", "⌈" }, { "rceil", "⌉" } };
@@ -528,7 +528,7 @@ internal static class OmmlMathBuilder
         { "implies", "⇒" }, { "iff", "⇔" }, { "mapsto", "↦" }, { "to", "→" },
         { "sum", "∑" }, { "prod", "∏" }, { "coprod", "∐" }, { "bigcup", "⋃" }, { "bigcap", "⋂" }, { "bigvee", "⋁" }, { "bigwedge", "⋀" }, { "int", "∫" }, { "iint", "∬" }, { "iiint", "∭" }, { "oint", "∮" }, { "oiint", "∯" }, { "oiiint", "∰" },
         { "sin", "sin" }, { "cos", "cos" }, { "tan", "tan" }, { "cot", "cot" }, { "sec", "sec" }, { "csc", "csc" }, { "sinh", "sinh" }, { "cosh", "cosh" }, { "tanh", "tanh" }, { "coth", "coth" },
-        { "arcsin", "arcsin" }, { "arccos", "arccos" }, { "arctan", "arctan" }, { "lim", "lim" }, { "limsup", "lim sup" }, { "liminf", "lim inf" }, { "log", "log" }, { "ln", "ln" }, { "exp", "exp" }, { "min", "min" }, { "max", "max" }, { "sup", "sup" }, { "inf", "inf" }, { "det", "det" }, { "gcd", "gcd" }, { "lcm", "lcm" }, { "rank", "rank" }, { "tr", "tr" }, { "diag", "diag" }, { "ker", "ker" }, { "dim", "dim" }, { "span", "span" }, { "sgn", "sgn" }, { "arg", "arg" }, { "Pr", "Pr" }, { "Var", "Var" }, { "Cov", "Cov" },
+        { "arcsin", "arcsin" }, { "arccos", "arccos" }, { "arctan", "arctan" }, { "arcsec", "arcsec" }, { "arccsc", "arccsc" }, { "arccot", "arccot" }, { "lim", "lim" }, { "limsup", "lim sup" }, { "liminf", "lim inf" }, { "log", "log" }, { "lg", "lg" }, { "lb", "lb" }, { "ln", "ln" }, { "exp", "exp" }, { "min", "min" }, { "max", "max" }, { "sup", "sup" }, { "inf", "inf" }, { "det", "det" }, { "gcd", "gcd" }, { "lcm", "lcm" }, { "rank", "rank" }, { "tr", "tr" }, { "diag", "diag" }, { "ker", "ker" }, { "dim", "dim" }, { "span", "span" }, { "sgn", "sgn" }, { "arg", "arg" }, { "Pr", "Pr" }, { "Var", "Var" }, { "Cov", "Cov" },
         { "therefore", "∴" }, { "because", "∵" }, { "perp", "⊥" }, { "parallel", "∥" }, { "triangle", "△" }, { "angle", "∠" }, { "measuredangle", "∡" }, { "degree", "°" }, { "emptyset", "∅" }, { "varnothing", "∅" },
         { "%", "%" }, { "#", "#" }, { "_", "_" }, { "&", "&" }, { "{", "{" }, { "}", "}" }
     };

@@ -3,15 +3,65 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using Microsoft.Win32;
+using System.Xml;
+using System.Xml.Linq;
+using System.Xml.Xsl;
 
 namespace AIGFH;
 
 public sealed class OfficeDocumentService
 {
     private readonly object _application;
+    // MathType's Word integration is shipped as a global template rather than
+    // as an Office COM command.  Keep the loaded COM objects alive for the
+    // duration of a conversion so Word does not unload the template between
+    // Application.Run calls.
+    private object _mathTypeTemplate;
+    private object _mathTypeAddIn;
+    private bool _mathTypeLoadAttempted;
+    private bool _mathTypeApiLoadAttempted;
+    private bool _mathTypeApiReady;
+
+    private static readonly object OmmlToMathMlSync = new object();
+    private static XslCompiledTransform _ommlToMathMlTransform;
+    private static string _ommlToMathMlPath;
+
+    private const short MathTypeLangTexInput = 1;
+    private const short MathTypeLangMathMl = 2;
+    private const int MathTypeOk = 0;
+
+    [DllImport("MathPage.wll", EntryPoint = "MTInitAPI", CallingConvention = CallingConvention.StdCall)]
+    private static extern int MathTypeInitApi(short options, short timeout);
+
+    [DllImport("MathPage.wll", EntryPoint = "MTTermAPI", CallingConvention = CallingConvention.StdCall)]
+    private static extern int MathTypeTermApi();
+
+    [DllImport("MathPage.wll", EntryPoint = "MTSetEqnFromLangStr", CallingConvention = CallingConvention.StdCall)]
+    private static extern int MathTypeSetEquationFromLanguage(
+        [MarshalAs(UnmanagedType.Interface)] object equationObject,
+        short languageType,
+        IntPtr languageString,
+        int stringLength);
+
+    [DllImport("MathPage.wll", EntryPoint = "MTGetLangStrFromEqn", CallingConvention = CallingConvention.StdCall)]
+    private static extern int MathTypeGetEquationLanguage(
+        [MarshalAs(UnmanagedType.Interface)] object equationObject,
+        short languageType,
+        IntPtr languageString,
+        ref int stringLength);
+
+    [DllImport("MathPage.wll", EntryPoint = "MTCloseOleObject", CallingConvention = CallingConvention.StdCall)]
+    private static extern int MathTypeCloseOleObject(
+        int saveOptions,
+        [MarshalAs(UnmanagedType.Interface)] object equationObject);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool SetDllDirectory(string path);
 
     public OfficeDocumentService(object application)
     {
@@ -251,7 +301,7 @@ public sealed class OfficeDocumentService
                 ResetWpsTextStyle(range, settings);
                 changed += RemoveOuterMarkdownFenceInPlace(document, range);
             }
-            changed += NormalizeMarkdownInPlace(document, range);
+                changed += NormalizeMarkdownInPlace(document, range, !settings.RemoveMarkdownHeadings);
             NormalizeNumberedListBodyStyles(range);
             FinishAiWebLayout(document, (int)range.Start, (int)range.End);
             SelectScopeRange(range, settings.ProcessingScope);
@@ -268,7 +318,7 @@ public sealed class OfficeDocumentService
         // Word converts CRLF pairs to a single paragraph mark on assignment.
         // Reuse the adjusted COM range end instead of the source string length.
         range = document.Range(start, (int)range.End);
-        range = RenderMarkdownRangeAsWeb(document, range, true, settings);
+        range = RenderMarkdownRangeAsWeb(document, range, !settings.RemoveMarkdownHeadings, settings);
         NormalizeNumberedListBodyStyles(range);
         FinishAiWebLayout(document, (int)range.Start, (int)range.End);
         SelectScopeRange(range, settings.ProcessingScope);
@@ -298,7 +348,7 @@ public sealed class OfficeDocumentService
                 ResetWpsTextStyle(range, settings);
                 changed += RemoveOuterMarkdownFenceInPlace(document, range);
             }
-            changed += NormalizeMarkdownInPlace(document, range);
+            changed += NormalizeMarkdownInPlace(document, range, !settings.RemoveMarkdownHeadings);
             // 二次排版或混合文档中可能同时存在原生公式和仍未转换的 TeX。
             // WPS 路径先修复旧版线性 OMath，再转换其余定界公式。
             var previousScope = settings.ProcessingScope;
@@ -332,7 +382,7 @@ public sealed class OfficeDocumentService
         var start = (int)range.Start;
         range.Text = text;
         range = document.Range(start, (int)range.End);
-        range = RenderMarkdownRangeAsWeb(document, range, true, settings);
+        range = RenderMarkdownRangeAsWeb(document, range, !settings.RemoveMarkdownHeadings, settings);
         PrepareExamChoiceParagraphs(document, settings.ChoiceColumns);
         var count = RestoreProtectedFormulas(document, pendingFormulas);
         ApplyExamPaperStyle(document, paperSize, landscape, settings);
@@ -545,6 +595,7 @@ public sealed class OfficeDocumentService
                 {
                     var latex = OmmlToLatexConverter.ConvertLinear(candidate.Item3);
                     if (String.IsNullOrWhiteSpace(latex)) latex = NormalizeLatexInput(candidate.Item3);
+                    else latex = NormalizeLatexInput(latex);
                     // FormattedText 直接覆盖 WPS 的旧线性 OMath 时，WPS 会保留旧对象外壳，
                     // 随后的专业结构校验失败并回滚成普通文本。先以已去除占位提示的
                     // 可见表达式替换整个旧对象，再把这段普通文本替换成 OMML。
@@ -954,7 +1005,7 @@ public sealed class OfficeDocumentService
         if (Regex.IsMatch(value,
             @"(?:\A|(?<=[\r\n\v\f\u0085\u2028\u2029])|(?<=[^\p{L}\p{N}\\#]))#{1,6}[ \t]+\S")) return true;
         if (Regex.IsMatch(value, @"(?is)<(?:h[1-6]|p|table|ul|ol|li|blockquote)\b")) return true;
-        return Regex.IsMatch(value, @"\\(?:documentclass|usepackage|geometry|begin\{document\}|(?:subsubsection|subsection|section)\*?\{|begin\{(?:enumerate|itemize|description|tabular|tabularx|longtable|theorem|lemma|definition|proof)\})");
+        return Regex.IsMatch(value, @"\\(?:documentclass|usepackage|geometry|begin\{document\}|begin\s*(?:\{|\()|(?:subsubsection|subsection|section)\*?\{|begin\{(?:enumerate|itemize|description|tabular|tabularx|longtable|theorem|lemma|definition|proof)\})");
     }
 
     private static bool IsLatexDocumentSource(string text)
@@ -1149,7 +1200,9 @@ public sealed class OfficeDocumentService
         value = Regex.Replace(value, @"\\\)(?=(?:积化和差|和差化积|正弦定理|余弦定理|三角形面积)\\\()", "\\)\r\r");
         value = Regex.Replace(value, @"(?<!^)(?<![\r\n])(?=(?:正弦定理|余弦定理|三角形面积)\\\()", "\r\r");
         value = Regex.Replace(value, @"(?:\A|(?<=[\r\n]))(?<sub>(?:积化和差|和差化积|正弦定理|余弦定理|三角形面积))(?=\\\()", "### ${sub}\r");
-        value = Regex.Replace(value, @"(?:\A|(?<=[\r\n]))(?<number>\d+[\.．、])\s*", "### ${number} ");
+        // Do not promote every numbered line to an H3.  Exam questions and
+        // answer choices use the same ``1.``/``（1）`` notation; the Markdown
+        // renderer can preserve those as ordinary numbered-list paragraphs.
         value = Regex.Replace(value, @"(?:\A|(?<=[\r\n]))(?!##\s)(?<section>[一二三四五六七八九十百]{1,3}、[^\r\n]+)(?=\r|\n|\z)", "## ${section}");
         value = Regex.Replace(value, @"[ \t\u00A0\u202F\u3000]+(?=\r)", String.Empty);
         value = Regex.Replace(value, @"\r[ \t\u00A0\u202F\u3000]+(?=\r)", "\r");
@@ -1593,7 +1646,7 @@ public sealed class OfficeDocumentService
         value = value.Replace("反斜杠quad", "\\quad").Replace("反斜杠qquad", "\\qquad");
         value = Regex.Replace(
             value,
-            @"\\\\(?=(?:begin|end|frac|dfrac|tfrac|binom|sqrt|text|textcolor|color|mathrm|mathbf|mathit|mathnormal|mathbb|mathcal|mathfrak|boldsymbol|bm|operatorname|overset|underset|overbrace|underbrace|substack|cancel|bcancel|xcancel|boxed|left|right|sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|lim|limsup|liminf|log|ln|exp|Pr|alpha|beta|gamma|delta|epsilon|theta|lambda|mu|nu|xi|pi|rho|sigma|tau|phi|varphi|omega|sum|prod|int|quad|qquad|cdot|times|leqslant|geqslant|leq|geq|le|ge|lt|gt|neq|approx|equiv|infty|pm|mp|div|in|notin|subset|supset|cup|cap|forall|exists|partial|nabla|Longrightarrow|Longleftarrow|Longleftrightarrow|Rightarrow|Leftarrow|Leftrightarrow|longrightarrow|longleftarrow|longleftrightarrow|rightarrow|leftarrow|leftrightarrow|implies|iff|mapsto|to|therefore|because|perp|parallel)\b)",
+            @"\\\\(?=(?:begin|end|frac|dfrac|tfrac|binom|sqrt|text|textcolor|color|mathrm|mathbf|mathit|mathnormal|mathbb|mathcal|mathfrak|boldsymbol|bm|operatorname|overset|underset|overbrace|underbrace|substack|cancel|bcancel|xcancel|boxed|left|right|sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|lim|limsup|liminf|log|lg|lb|ln|exp|Pr|alpha|beta|gamma|delta|epsilon|theta|lambda|mu|nu|xi|pi|rho|sigma|tau|phi|varphi|omega|sum|prod|int|quad|qquad|cdot|times|leqslant|geqslant|leq|geq|le|ge|lt|gt|neq|approx|equiv|infty|pm|mp|div|in|notin|subset|supset|cup|cap|forall|exists|partial|nabla|Longrightarrow|Longleftarrow|Longleftrightarrow|Rightarrow|Leftarrow|Leftrightarrow|longrightarrow|longleftarrow|longleftrightarrow|rightarrow|leftarrow|leftrightarrow|implies|iff|mapsto|to|therefore|because|perp|parallel)\b)",
             "\\");
 
         // ChatGPT/GPT 网页复制有时会把 \[...\] 的反斜杠丢掉，并把等号
@@ -2658,8 +2711,14 @@ public sealed class OfficeDocumentService
         catch (InvalidOperationException) { throw; }
         catch { if (String.Equals(scope, "Selection", StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("请先选中需要转换的 MathType 公式。"); }
 
+        var mathTypeApiReady = false;
         try
         {
+            // MathType OLE objects do not expose their TeX through the normal
+            // OLEFormat properties until the object is activated.  Keep the
+            // native API available as a fallback for objects created by this
+            // add-in as well as equations inserted by MathType itself.
+            mathTypeApiReady = EnsureMathTypeApiReady();
             // 浮动 MathType/OLE 公式先转换为嵌入式对象，再沿用同一条转换路径。
             for (var index = SafeCollectionCount(document.Shapes); index >= 1; index--)
             {
@@ -2706,6 +2765,8 @@ public sealed class OfficeDocumentService
                 catch { }
 
                 var source = ReadEquationOleText(shape);
+                if (String.IsNullOrWhiteSpace(source) && mathTypeApiReady)
+                    source = ReadMathTypeEquationText(shape);
                 if (String.IsNullOrWhiteSpace(source)) continue;
                 try
                 {
@@ -2718,6 +2779,7 @@ public sealed class OfficeDocumentService
         }
         finally
         {
+            if (mathTypeApiReady) TryTerminateMathTypeApi();
             if (selectionScope && scopedRange != null) SelectScopeRange(scopedRange, "Selection");
             else RestoreSelection(document, originalStart, originalEnd);
         }
@@ -2734,7 +2796,6 @@ public sealed class OfficeDocumentService
         var originalStart = -1;
         var originalEnd = -1;
         dynamic target = document.Content;
-        var selectionScope = false;
         try
         {
             dynamic selected = ((dynamic)_application).Selection.Range;
@@ -2744,7 +2805,6 @@ public sealed class OfficeDocumentService
                 (String.Equals(scope, "Selection", StringComparison.OrdinalIgnoreCase) ||
                  String.Equals(scope, "Auto", StringComparison.OrdinalIgnoreCase)))
             {
-                selectionScope = true;
                 target = selected.Duplicate;
             }
             else if (String.Equals(scope, "Selection", StringComparison.OrdinalIgnoreCase))
@@ -2757,18 +2817,262 @@ public sealed class OfficeDocumentService
         if (targetMath == 0) return -2;
         try
         {
+            // MathType's Convert Equations dialog defaults to MathType/fields
+            // (ConvertFrom=3), so an OMML-only document reports "no equations"
+            // unless the OMML bit is enabled.  Persist the same settings the
+            // template uses when the user checks Word 2007 (OMML).
+            EnsureMathTypeConversionPreferences();
+
+            target.Select();
+
+            // The template's public DoConvertEquations routine eventually
+            // calls MTXFormReset through a VBA command guard.  Several Word
+            // builds crash when that routine is invoked through Application.Run
+            // directly.  Use MathType's documented OLE automation entry point
+            // first; this produces the same Equation.DSMT4 object without any
+            // dialog and works with the supplied MathPage.wll/template.
+            var direct = ConvertOfficeMathToMathTypeDirect(document, (int)target.Start, (int)target.End);
+            if (direct >= targetMath || GetOfficeMathSpans(document, (int)target.Start, (int)target.End).Count == 0)
+                return direct;
+
+            // Keep the native command as a fallback for installations whose
+            // MathPage.wll is not reachable by the add-in process.
             var beforeMath = SafeCollectionCount(document.OMaths);
             var beforeShapes = SafeCollectionCount(document.InlineShapes) + SafeCollectionCount(document.Shapes);
-            target.Select();
-            if (!TryExecuteMso("MathConvertToMathType") && !TryRunMathTypeConvertCommand()) return -1;
+            try { target.Select(); } catch { }
+            var commandRan = TryExecuteMso("MathConvertToMathType");
+            if (!commandRan) commandRan = TryRunMathTypeConvertCommand();
             var remaining = SafeCollectionCount(document.OMaths);
             var shapes = SafeCollectionCount(document.InlineShapes) + SafeCollectionCount(document.Shapes);
-            return Math.Max(beforeMath - remaining, Math.Max(0, shapes - beforeShapes));
+            var commandCount = Math.Max(beforeMath - remaining, Math.Max(0, shapes - beforeShapes));
+            if (commandCount > 0) return direct + commandCount;
+            return direct > 0 ? direct : -1;
         }
         finally
         {
-            if (selectionScope) SelectScopeRange(target, "Selection");
-            else RestoreSelection(document, originalStart, originalEnd);
+            TryTerminateMathTypeApi();
+            // The original target Range is mutated when an OMath is replaced
+            // by an OLE shape (Word/WPS often collapses its End to Start).
+            // Restore the captured coordinates instead of re-selecting that
+            // mutated COM range, otherwise a selected equation leaves the
+            // insertion point at its start.
+            RestoreSelection(document, originalStart, originalEnd);
+        }
+    }
+
+    /// <summary>
+    /// Converts each selected Office Math object to a MathType Equation.DSMT4
+    /// OLE object through MathPage.wll.  MathType's Word template uses this
+    /// exact MTSetEqnFromLangStr/MTCloseOleObject pair in MTSetData.bas.
+    /// </summary>
+    private int ConvertOfficeMathToMathTypeDirect(dynamic document, int scopeStart, int scopeEnd)
+    {
+        if (!EnsureMathTypeApiReady()) return 0;
+
+        var converted = 0;
+        for (var index = SafeCollectionCount(document.OMaths); index >= 1; index--)
+        {
+            dynamic math;
+            try { math = document.OMaths[index]; } catch { continue; }
+
+            dynamic mathRange;
+            int start;
+            int end;
+            try
+            {
+                mathRange = math.Range;
+                start = (int)mathRange.Start;
+                end = (int)mathRange.End;
+            }
+            catch { continue; }
+
+            if (start >= scopeEnd || end <= scopeStart) continue;
+            var latex = ReadOfficeMathLatex(math);
+            if (String.IsNullOrWhiteSpace(latex)) continue;
+            if (TryReplaceOfficeMathWithMathType(document, start, end, latex)) converted++;
+        }
+        return converted;
+    }
+
+    private static string ReadOfficeMathLatex(dynamic math)
+    {
+        string xml = String.Empty;
+        try { xml = Convert.ToString(math.Range.WordOpenXML) ?? String.Empty; } catch { }
+        var latex = String.Empty;
+        if (!String.IsNullOrWhiteSpace(xml))
+        {
+            try { latex = OmmlToLatexConverter.Convert(xml); } catch { }
+        }
+
+        if (String.IsNullOrWhiteSpace(latex))
+        {
+            string linear = String.Empty;
+            try { linear = Convert.ToString(math.Range.Text) ?? String.Empty; } catch { }
+            linear = linear.Replace("\r", String.Empty).Replace("\n", String.Empty).Trim();
+            if (!String.IsNullOrWhiteSpace(linear))
+            {
+                try { latex = OmmlToLatexConverter.ConvertLinear(linear); } catch { latex = linear; }
+            }
+        }
+
+        latex = latex.Trim().Trim('$').Trim();
+        return latex;
+    }
+
+    private bool TryReplaceOfficeMathWithMathType(dynamic document, int start, int end, string latex)
+    {
+        dynamic shape = null;
+        dynamic equationObject = null;
+        try
+        {
+            // Remove the OMath first, then insert the OLE at the same collapsed
+            // range.  Doing this in reverse document order keeps all positions
+            // collected by the caller valid.
+            dynamic oldRange = document.Range(start, end);
+            oldRange.Text = String.Empty;
+            dynamic insertRange = document.Range(start, start);
+            shape = document.InlineShapes.AddOLEObject(
+                "Equation.3", String.Empty, false, false,
+                Type.Missing, Type.Missing, Type.Missing, insertRange);
+
+            // MTSetEqnFromLangStr can populate a newly created Equation.3
+            // object directly.  Do not call OLEFormat.DoVerb here: it opens
+            // the MathType editor window and crashes some Word 2016/WPS builds
+            // when the host is running invisibly or from an add-in callback.
+            equationObject = shape.OLEFormat.Object;
+            if (equationObject == null) throw new InvalidOperationException("MathType OLE 对象未创建");
+
+            var ptr = Marshal.StringToCoTaskMemUni(latex);
+            try
+            {
+                var status = MathTypeSetEquationFromLanguage(
+                    equationObject, MathTypeLangTexInput, ptr, latex.Length);
+                if (status != MathTypeOk) throw new InvalidOperationException("MathType 写入公式失败: " + status);
+            }
+            finally { Marshal.FreeCoTaskMem(ptr); }
+
+            var closeStatus = MathTypeCloseOleObject(1, equationObject);
+            equationObject = null;
+            if (closeStatus != MathTypeOk) throw new InvalidOperationException("MathType 关闭公式失败: " + closeStatus);
+            return true;
+        }
+        catch
+        {
+            try { if (equationObject != null) MathTypeCloseOleObject(0, equationObject); } catch { }
+            try { if (shape != null) shape.Delete(); } catch { }
+            // The OMath range was cleared before the OLE object was created.
+            // Put the source back first, then rebuild that exact span as a
+            // native Office equation.  Reusing the old end offset here would
+            // consume the following paragraph because the document has
+            // already shrunk by the deleted OMath length.
+            try
+            {
+                var restored = latex ?? String.Empty;
+                if (restored.Length > 0)
+                {
+                    document.Range(start, start).Text = restored;
+                    ReplaceWithOfficeMath(document, start, restored.Length, restored, false);
+                }
+            }
+            catch { }
+            return false;
+        }
+    }
+
+    private void EnsureMathTypeConversionPreferences()
+    {
+        var paths = new[]
+        {
+            @"Software\Design Science\DSMT7\WordCommands",
+            @"Software\Design Science\DSMT6\WordCommands"
+        };
+        foreach (var path in paths)
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.CreateSubKey(path))
+                {
+                    if (key == null) continue;
+                    key.SetValue("ConvertFrom", "8", RegistryValueKind.String);
+                    key.SetValue("ConvertTo", "0", RegistryValueKind.String);
+                    key.SetValue("ConvertMisc", "0", RegistryValueKind.String);
+                }
+            }
+            catch { }
+        }
+    }
+
+    private bool EnsureMathTypeApiReady()
+    {
+        if (_mathTypeApiReady) return true;
+        if (_mathTypeApiLoadAttempted) return false;
+        _mathTypeApiLoadAttempted = true;
+
+        foreach (var file in GetMathPageCandidates())
+        {
+            try
+            {
+                var directory = Path.GetDirectoryName(file);
+                if (String.IsNullOrWhiteSpace(directory)) continue;
+                if (!SetDllDirectory(directory)) continue;
+                var status = MathTypeInitApi(0, 30000);
+                if (status >= 0)
+                {
+                    _mathTypeApiReady = true;
+                    return true;
+                }
+            }
+            catch { }
+        }
+        return false;
+    }
+
+    private void TryTerminateMathTypeApi()
+    {
+        if (!_mathTypeApiReady) return;
+        try { MathTypeTermApi(); } catch { }
+        _mathTypeApiReady = false;
+        _mathTypeApiLoadAttempted = false;
+    }
+
+    private IEnumerable<string> GetMathPageCandidates()
+    {
+        var roots = new List<string>();
+        try
+        {
+            var assemblyDirectory = Path.GetDirectoryName(typeof(OfficeDocumentService).Assembly.Location);
+            if (!String.IsNullOrWhiteSpace(assemblyDirectory)) roots.Add(assemblyDirectory);
+        }
+        catch { }
+        try
+        {
+            var startup = Convert.ToString(((dynamic)_application).StartupPath);
+            if (!String.IsNullOrWhiteSpace(startup))
+            {
+                roots.Add(startup);
+                roots.Add(Path.Combine(startup, "STARTUP"));
+            }
+        }
+        catch { }
+
+        var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        var programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+        foreach (var pf in new[] { programFiles, programFilesX86 })
+        {
+            if (String.IsNullOrWhiteSpace(pf)) continue;
+            roots.Add(Path.Combine(pf, "MathType", "MathPage", Environment.Is64BitProcess ? "64" : "32"));
+            roots.Add(Path.Combine(pf, "MathType", "MathPage"));
+            roots.Add(Path.Combine(pf, "Microsoft Office", "root", "Office16", "STARTUP"));
+        }
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var root in roots)
+        {
+            if (String.IsNullOrWhiteSpace(root)) continue;
+            string file;
+            try { file = Path.GetFullPath(Path.Combine(root, "MathPage.wll")); }
+            catch { continue; }
+            if (seen.Add(file) && File.Exists(file)) yield return file;
         }
     }
 
@@ -2797,8 +3101,20 @@ public sealed class OfficeDocumentService
 
     private bool TryRunMathTypeConvertCommand()
     {
+        // MathType 6/7 installs the Word commands in
+        // "MathType Commands 2016.dotm".  On machines where the template is
+        // not in Word's STARTUP folder (or when Word/WPS started before the
+        // template was copied), load it on demand before trying the macro.
+        EnsureMathTypeCommandsLoaded();
+
         var macros = new[]
         {
+            // Public entry point in the 2016 template (module UILib).
+            "MTCommand_ConvertEqns",
+            "MathType Commands 2016.dotm!MTCommand_ConvertEqns",
+            "MathTypeCommands2016.dotm!MTCommand_ConvertEqns",
+            "MathTypeCommands.UILib.MTCommand_ConvertEqns",
+            "MathTypeCommands2016.UILib.MTCommand_ConvertEqns",
             "MathTypeCommands.UILib.MTCommand_ConvertEquations",
             "MathTypeCommands2016.UILib.MTCommand_ConvertEquations",
             "MTCommand_ConvertEquations"
@@ -2809,6 +3125,148 @@ public sealed class OfficeDocumentService
             catch { }
         }
         return false;
+    }
+
+    /// <summary>
+    /// Ensures that MathType's Word command template is available to
+    /// Application.Run.  MathType normally places the template in the Office
+    /// STARTUP folder, but portable/repair installs and WPS often leave it in
+    /// the MathType Office Support folder.  We support both layouts and the
+    /// template next to this add-in.
+    /// </summary>
+    private bool EnsureMathTypeCommandsLoaded()
+    {
+        if (_mathTypeLoadAttempted)
+            return _mathTypeTemplate != null || _mathTypeAddIn != null || HasLoadedMathTypeCommands();
+
+        _mathTypeLoadAttempted = true;
+        try
+        {
+            if (HasLoadedMathTypeCommands()) return true;
+
+            foreach (var path in GetMathTypeTemplateCandidates())
+            {
+                // AddIns.Add(..., Install:=True) is the same mechanism used by
+                // MathType's own installer and runs AutoExec/initialisation
+                // code in the template.
+                try
+                {
+                    dynamic addIns = ((dynamic)_application).AddIns;
+                    _mathTypeAddIn = addIns.Add(path, true);
+                    if (HasLoadedMathTypeCommands()) return true;
+                }
+                catch { }
+
+                // Some Word/WPS builds expose Templates.Add but not AddIns.Add
+                // for a .dotm.  Keep the template object referenced so its
+                // public macros remain callable.
+                try
+                {
+                    dynamic templates = ((dynamic)_application).Templates;
+                    _mathTypeTemplate = templates.Add(path, false, 0, false);
+                    if (HasLoadedMathTypeCommands()) return true;
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return HasLoadedMathTypeCommands();
+    }
+
+    private bool HasLoadedMathTypeCommands()
+    {
+        dynamic app;
+        try { app = ((dynamic)_application); }
+        catch { return false; }
+        try { if (CollectionContainsMathTypeTemplate(app.AddIns)) return true; }
+        catch { }
+        try { if (CollectionContainsMathTypeTemplate(app.Templates)) return true; }
+        catch { }
+        return false;
+    }
+
+    private static bool CollectionContainsMathTypeTemplate(dynamic collection)
+    {
+        var count = SafeCollectionCount(collection);
+        for (var index = 1; index <= count; index++)
+        {
+            try
+            {
+                dynamic item;
+                try { item = collection[index]; }
+                catch { item = collection.Item(index); }
+                var name = String.Empty;
+                try { name = Convert.ToString(item.Name) ?? String.Empty; } catch { }
+                if (name.IndexOf("MathType", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                    name.IndexOf("Command", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+                try
+                {
+                    var fullName = Convert.ToString(item.FullName) ?? String.Empty;
+                    if (fullName.IndexOf("MathType", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                        fullName.IndexOf("Command", StringComparison.OrdinalIgnoreCase) >= 0)
+                        return true;
+                }
+                catch { }
+            }
+            catch { }
+        }
+        return false;
+    }
+
+    private IEnumerable<string> GetMathTypeTemplateCandidates()
+    {
+        var names = new[]
+        {
+            "MathType Commands 2016.dotm",
+            "MathType Commands 2013.dotm",
+            "MathType Commands.dotm"
+        };
+        var roots = new List<string>();
+        try
+        {
+            var assemblyDirectory = Path.GetDirectoryName(typeof(OfficeDocumentService).Assembly.Location);
+            if (!String.IsNullOrWhiteSpace(assemblyDirectory)) roots.Add(assemblyDirectory);
+        }
+        catch { }
+        try
+        {
+            var startup = Convert.ToString(((dynamic)_application).StartupPath);
+            if (!String.IsNullOrWhiteSpace(startup))
+            {
+                roots.Add(startup);
+                roots.Add(Path.Combine(startup, "STARTUP"));
+            }
+        }
+        catch { }
+
+        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        if (!String.IsNullOrWhiteSpace(appData))
+            roots.Add(Path.Combine(appData, "Microsoft", "Word", "STARTUP"));
+
+        var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        var programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+        foreach (var pf in new[] { programFiles, programFilesX86 })
+        {
+            if (String.IsNullOrWhiteSpace(pf)) continue;
+            roots.Add(Path.Combine(pf, "MathType", "Office Support", "64"));
+            roots.Add(Path.Combine(pf, "MathType", "Office Support", "32"));
+            roots.Add(Path.Combine(pf, "Microsoft Office", "root", "Office16", "STARTUP"));
+            roots.Add(Path.Combine(pf, "Microsoft Office", "root", "Office16"));
+        }
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var root in roots)
+        {
+            if (String.IsNullOrWhiteSpace(root)) continue;
+            foreach (var name in names)
+            {
+                string path;
+                try { path = Path.GetFullPath(Path.Combine(root, name)); }
+                catch { continue; }
+                if (seen.Add(path) && File.Exists(path)) yield return path;
+            }
+        }
     }
 
     private static int SafeCollectionCount(dynamic collection)
@@ -2839,6 +3297,58 @@ public sealed class OfficeDocumentService
         return String.Empty;
     }
 
+    private static string ReadMathTypeEquationText(dynamic shape)
+    {
+        dynamic equation = null;
+        try { equation = shape.OLEFormat.Object; } catch { return String.Empty; }
+        if (equation == null) return String.Empty;
+
+        try
+        {
+            // MTGetLangStrFromEqn follows the VBA template's two-call
+            // convention: first query the character count, then provide a
+            // writable buffer.  The native routine returns UTF-16 on recent
+            // MathType builds and ANSI/UTF-8 on older 6.x builds, so decode
+            // based on the observed byte pattern rather than assuming one.
+            var length = 0;
+            var status = MathTypeGetEquationLanguage(equation, MathTypeLangTexInput, IntPtr.Zero, ref length);
+            if (status != MathTypeOk || length <= 0 || length > 1_000_000) return String.Empty;
+
+            var byteLength = checked((length + 2) * 2);
+            var buffer = Marshal.AllocCoTaskMem(byteLength);
+            try
+            {
+                for (var index = 0; index < byteLength; index++) Marshal.WriteByte(buffer, index, 0);
+                var actualLength = length;
+                status = MathTypeGetEquationLanguage(equation, MathTypeLangTexInput, buffer, ref actualLength);
+                if (status != MathTypeOk || actualLength <= 0) return String.Empty;
+
+                var bytes = new byte[byteLength];
+                Marshal.Copy(buffer, bytes, 0, bytes.Length);
+                var used = Math.Min(bytes.Length, Math.Max(1, actualLength) * 2);
+                var utf16 = true;
+                for (var index = 1; index < used; index += 2)
+                {
+                    if (bytes[index] != 0) { utf16 = false; break; }
+                }
+                string text;
+                if (utf16)
+                    text = Encoding.Unicode.GetString(bytes, 0, used).TrimEnd('\0');
+                else
+                {
+                    var zero = Array.IndexOf(bytes, (byte)0, 0, Math.Min(bytes.Length, Math.Max(1, actualLength)));
+                    if (zero < 0) zero = Math.Min(bytes.Length, Math.Max(1, actualLength));
+                    text = Encoding.UTF8.GetString(bytes, 0, zero).TrimEnd('\0');
+                    if (text.IndexOf('\uFFFD') >= 0)
+                        text = Encoding.Default.GetString(bytes, 0, zero).TrimEnd('\0');
+                }
+                return text.Trim();
+            }
+            finally { Marshal.FreeCoTaskMem(buffer); }
+        }
+        catch { return String.Empty; }
+    }
+
     private static string ToLatexText(string value)
     {
         var replacements = new[] { new[] { "×", "\\times" }, new[] { "≤", "\\leq" }, new[] { "≥", "\\geq" }, new[] { "≠", "\\neq" }, new[] { "∞", "\\infty" }, new[] { "±", "\\pm" }, new[] { "π", "\\pi" }, new[] { "α", "\\alpha" }, new[] { "β", "\\beta" }, new[] { "γ", "\\gamma" }, new[] { "θ", "\\theta" }, new[] { "∑", "\\sum" }, new[] { "∏", "\\prod" }, new[] { "∫", "\\int" } };
@@ -2867,7 +3377,7 @@ public sealed class OfficeDocumentService
     {
         return Regex.Matches(
             source,
-            @"\$\$(?<display>.+?)\$\$|(?<!\\)(?<!\$)\$(?!\$)(?<dollar>[^\r\n]+?)(?<!\\)\$(?!\$)|\\{1,2}\((?<paren>[^\r\n]+?)\\{1,2}\)|\\{1,2}\[(?<bracket>.+?)\\{1,2}\]|```(?:latex|tex|math)?[ \t]*(?:\r\n|\r|\n)(?<fence>.+?)(?:\r\n|\r|\n)```|(?<environment>\\begin\s*\{(?<envname>math|displaymath|equation\*?|align\*?|aligned|alignedat|alignat\*?|flalign\*?|gather\*?|gathered|multline\*?|multlined|split|cases|dcases|array|matrix|smallmatrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix)\}.*?\\end\s*\{\k<envname>\})|(?:\A|(?<=\r)|(?<=\n))[ \t]*\\?\[[ \t]*(?:\r\n|\r|\n)(?<block>.+?)(?:\r\n|\r|\n)[ \t]*\\?\][ \t]*(?=\r|\n|\z)|(?:\A|(?<=\r)|(?<=\n))[ \t]*(?<line>\\(?:begin|sin|cos|tan|cot|sec|csc|frac|dfrac|tfrac|cfrac|sqrt|vec|overline|widehat|text|operatorname|mathbb|alpha|beta|gamma|delta|theta|lambda|mu|pi|sum|prod|int|iint|iiint|oint|lim|det|Pr)(?=\b|\d|\{|\s)[^\r\n]*)[ \t]*(?=\r|\n|\z)",
+            @"\$\$(?<display>.+?)\$\$|(?<!\\)(?<!\$)\$(?!\$)(?<dollar>[^\r\n]+?)(?<!\\)\$(?!\$)|\\{1,2}\((?<paren>[^\r\n]+?)\\{1,2}\)|\\{1,2}\[(?<bracket>.+?)\\{1,2}\]|```(?:latex|tex|math)?[ \t]*(?:\r\n|\r|\n)(?<fence>.+?)(?:\r\n|\r|\n)```|(?<environment>\\begin\s*\{(?<envname>math|displaymath|equation\*?|align\*?|aligned|alignedat|alignat\*?|flalign\*?|gather\*?|gathered|multline\*?|multlined|split|cases|dcases|array|matrix|smallmatrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix)\}.*?\\end\s*\{\k<envname>\})|(?:\A|(?<=\r)|(?<=\n))[ \t]*\\?\[[ \t]*(?:\r\n|\r|\n)(?<block>.+?)(?:\r\n|\r|\n)[ \t]*\\?\][ \t]*(?=\r|\n|\z)|(?:\A|(?<=\r)|(?<=\n))[ \t]*(?<line>\\(?:begin|arcsin|arccos|arctan|arccot|arcsec|arccsc|sin|cos|tan|cot|sec|csc|frac|dfrac|tfrac|cfrac|sqrt|vec|overline|widehat|text|operatorname|mathbb|alpha|beta|gamma|delta|theta|lambda|mu|pi|sum|prod|int|iint|iiint|oint|lim|det|Pr|lg|lb|cap|cup|in|notin|subseteq|supseteq|subset|supset|parallel|perp|angle|mid|leq|geq|neq|approx|equiv|pm|mp)(?=\b|\d|\{|\(|\s)[^\r\n]*)[ \t]*(?=\r|\n|\z)",
             RegexOptions.Singleline);
     }
 
@@ -2910,7 +3420,7 @@ public sealed class OfficeDocumentService
         // “同理 a<-\dfrac13\)。”。强 TeX 命令仍能可靠表明这是公式，
         // 因此只补捉包含这类命令的局部片段，不把整段普通文字改成公式。
         var strongCommands = Regex.Matches(source,
-            @"\\(?:eqarray|matrix|cases|dfrac|tfrac|cfrac|frac|sqrt|binom|sum|prod|coprod|bigcup|bigcap|int|iint|iiint|oint|oiint|lim|sin|cos|tan|cot|sec|csc|sinh|cosh|log|ln|exp|det|rank|ker|Pr|vec|overrightarrow|xrightarrow|xleftarrow|overline|widehat|mathbb|alpha|beta|gamma|delta|epsilon|varepsilon|theta|lambda|mu|pi|varphi|phi|triangle|emptyset|varnothing|underline|operatorname|lt|gt)(?=\b|\d|\{|\s|\()",
+            @"\\(?:begin|eqarray|matrix|cases|dfrac|tfrac|cfrac|frac|sqrt|binom|sum|prod|coprod|bigcup|bigcap|int|iint|iiint|oint|oiint|lim|arcsin|arccos|arctan|arccot|arcsec|arccsc|sin|cos|tan|cot|sec|csc|sinh|cosh|log|lg|lb|ln|exp|cap|cup|in|notin|subseteq|supseteq|subset|supset|parallel|perp|angle|mid|leq|geq|neq|approx|equiv|pm|mp|det|rank|ker|Pr|vec|overrightarrow|xrightarrow|xleftarrow|overline|widehat|mathbb|alpha|beta|gamma|delta|epsilon|varepsilon|theta|lambda|mu|pi|varphi|phi|triangle|emptyset|varnothing|underline|operatorname|lt|gt)(?=\b|\d|\{|\s|\()",
             RegexOptions.IgnoreCase);
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (Match command in strongCommands)
@@ -2919,7 +3429,18 @@ public sealed class OfficeDocumentService
             var start = command.Index;
             while (start > 0 && IsBareFormulaCharacter(source[start - 1], false)) start--;
             var end = command.Index + command.Length;
-            while (end < source.Length && IsBareFormulaCharacter(source[end], true)) end++;
+            var boundedEnvironment = false;
+            if (String.Equals(command.Value.TrimStart('\\'), "begin", StringComparison.OrdinalIgnoreCase))
+            {
+                var environmentEnd = FindEnvironmentFormulaEnd(source, start);
+                if (environmentEnd > start)
+                {
+                    end = environmentEnd;
+                    boundedEnvironment = true;
+                }
+            }
+            if (!boundedEnvironment)
+                while (end < source.Length && IsBareFormulaCharacter(source[end], true)) end++;
             while (start < end && (source[start] == ' ' || source[start] == '\t')) start++;
             while (end > start && (source[end - 1] == ' ' || source[end - 1] == '\t')) end--;
             while (end > start && ".,;:".IndexOf(source[end - 1]) >= 0) end--;
@@ -2947,12 +3468,57 @@ public sealed class OfficeDocumentService
                 Display = wholeLine && IsDisplayStyleFormula(formula)
             });
         }
+
+        // Set-builder expressions often contain only escaped braces and a
+        // relation (``A=\{x\mid x>0\}``), so they have no structural command
+        // from the list above.  Recover those local spans when they are not
+        // already covered by an explicit delimiter match.
+        foreach (Match setMatch in Regex.Matches(source, @"\\\{[^\r\n]*?\\\}", RegexOptions.Singleline))
+        {
+            if (occupied.Any(span => setMatch.Index >= span.Item1 && setMatch.Index < span.Item2)) continue;
+            var start = setMatch.Index;
+            while (start > 0 && IsBareFormulaCharacter(source[start - 1], false)) start--;
+            var end = setMatch.Index + setMatch.Length;
+            while (end < source.Length && IsBareFormulaCharacter(source[end], true)) end++;
+            while (start < end && (source[start] == ' ' || source[start] == '\t')) start++;
+            while (end > start && (source[end - 1] == ' ' || source[end - 1] == '\t')) end--;
+            var raw = source.Substring(start, end - start);
+            var formula = NormalizeBareFormulaBoundary(raw);
+            if (!Regex.IsMatch(formula, @"[=<>]|\\(?:cap|cup|in|notin|subset|supset|mid|parallel|perp)\b", RegexOptions.IgnoreCase)) continue;
+            if (result.Any(existing => start < existing.Index + existing.Length && end > existing.Index)) continue;
+            var lineStart = source.LastIndexOfAny(new[] { '\r', '\n' }, Math.Max(0, start - 1));
+            lineStart = lineStart < 0 ? 0 : lineStart + 1;
+            var lineEnd = source.IndexOfAny(new[] { '\r', '\n' }, end);
+            if (lineEnd < 0) lineEnd = source.Length;
+            var wholeLine = String.IsNullOrWhiteSpace(source.Substring(lineStart, start - lineStart)) &&
+                            String.IsNullOrWhiteSpace(source.Substring(end, lineEnd - end));
+            if (!IsReliableBareFormula(formula, wholeLine, false)) continue;
+            result.Add(new AiFormulaCandidate
+            {
+                Index = start,
+                Length = end - start,
+                Source = raw,
+                Formula = formula,
+                Display = wholeLine && IsDisplayStyleFormula(formula)
+            });
+            occupied.Add(Tuple.Create(start, end));
+        }
         return result.OrderBy(item => item.Index).ThenByDescending(item => item.Length).ToList();
+    }
+
+    private static int FindEnvironmentFormulaEnd(string source, int start)
+    {
+        if (String.IsNullOrEmpty(source) || start < 0 || start >= source.Length) return -1;
+        var tail = source.Substring(start);
+        var match = Regex.Match(tail,
+            @"\\{1,2}begin\s*(?:\{[^{}]+\}|\(\s*[^()]+\s*\)).*?\\{1,2}end\s*(?:\{[^{}]+\}|\(\s*[^()]+\s*\))",
+            RegexOptions.Singleline | RegexOptions.IgnoreCase);
+        return match.Success ? start + match.Index + match.Length : -1;
     }
 
     private static IEnumerable<AiFormulaCandidate> FindBalancedGptParenthesizedFormulas(string source)
     {
-        const string commandPattern = @"\A\\(?:frac|dfrac|tfrac|cfrac|sqrt|vec|overline|widehat|sin|cos|tan|cot|sec|csc|sinh|cosh|tanh|alpha|beta|gamma|delta|theta|lambda|mu|pi|sum|prod|int|iint|iiint|lim|det|Pr|mathbb|operatorname)(?![A-Za-z])";
+        const string commandPattern = @"\A\\(?:frac|dfrac|tfrac|cfrac|sqrt|vec|overline|widehat|arcsin|arccos|arctan|arccot|arcsec|arccsc|sin|cos|tan|cot|sec|csc|sinh|cosh|tanh|log|lg|lb|ln|alpha|beta|gamma|delta|theta|lambda|mu|pi|sum|prod|int|iint|iiint|lim|det|Pr|mathbb|operatorname)(?![A-Za-z])";
         for (var start = 0; start < source.Length; start++)
         {
             if (source[start] != '(' || start > 0 && source[start - 1] == '\\') continue;
@@ -2988,6 +3554,12 @@ public sealed class OfficeDocumentService
     private static bool IsReliableBareFormula(string formula, bool wholeLine, bool hasOrphanClosingDelimiter)
     {
         if (String.IsNullOrWhiteSpace(formula)) return false;
+        var normalizedEnvironment = NormalizeLatexInput(formula);
+        if (Regex.IsMatch(normalizedEnvironment,
+                @"\\begin\s*\{(?:math|displaymath|equation\*?|align\*?|aligned|alignedat|gather\*?|gathered|split|cases|dcases|array|matrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix)\}",
+                RegexOptions.IgnoreCase) &&
+            Regex.IsMatch(normalizedEnvironment, @"\\end\s*\{[^}]+\}", RegexOptions.IgnoreCase))
+            return true;
         var converted = ConvertAiLatexExpression(formula);
         // 结构命令仍然残留，通常意味着复制到的是命令说明或残缺参数，
         // 这时保留原文比把说明文字创建成公式更合适。
@@ -2999,13 +3571,13 @@ public sealed class OfficeDocumentService
         // 英文说明常见于“\frac{a}{b} means a fraction”。剔除命令后若仍有
         // 两个及以上的长英文单词，就不把整句当作数学表达式。
         if (Regex.Matches(withoutCommands, @"\b[A-Za-z]{3,}\b").Count >= 2) return false;
-        var mathSignals = Regex.Matches(formula, @"[=<>+\-*/^_]|\d|\\(?:frac|sqrt|binom|sum|prod|coprod|bigcup|bigcap|int|iint|iiint|oint|lim|det|vec|overline|mathbb)\b",
+        var mathSignals = Regex.Matches(formula, @"[=<>+\-*/^_]|\d|\\(?:frac|sqrt|binom|sum|prod|coprod|bigcup|bigcap|int|iint|iiint|oint|lim|det|vec|overline|mathbb|log|lg|lb|ln|cap|cup|in|notin|subseteq|supseteq|subset|supset|parallel|perp|angle|mid|leq|geq|neq|approx|equiv|pm|mp)\b",
             RegexOptions.IgnoreCase).Count;
         if (mathSignals == 0) return false;
         if (wholeLine) return true;
         // 行内无定界符公式至少需要一个完整的结构命令或明显的等式/不等式，
         // 避免把普通句子里的单个希腊字母命令误识别成整段公式。
-        return Regex.IsMatch(formula, @"\\(?:dfrac|tfrac|cfrac|frac|sqrt|binom|vec|overrightarrow|overline|widehat|sum|prod|int|iint|iiint|oint|det|mathbb|lt|gt|le|ge|leq|geq|ne|neq)\b|[=<>]",
+        return Regex.IsMatch(formula, @"\\(?:dfrac|tfrac|cfrac|frac|sqrt|binom|vec|overrightarrow|overline|widehat|sum|prod|int|iint|iiint|oint|det|mathbb|log|lg|lb|ln|cap|cup|in|notin|subseteq|supseteq|subset|supset|parallel|perp|angle|mid|leq|geq|neq|approx|equiv|pm|mp|lt|gt|le|ge|ne|neq)\b|[=<>]",
             RegexOptions.IgnoreCase);
     }
 
@@ -3033,6 +3605,10 @@ public sealed class OfficeDocumentService
     private static string NormalizeLatexInput(string source)
     {
         var value = NormalizeBareFormulaBoundary(NormalizeClipboardCharacters(source));
+        // Normalize doubled command escapes emitted by Doubao/DeepSeek while
+        // leaving ``\\`` row separators intact (the latter are followed by
+        // whitespace, another slash, or end-of-input rather than a letter).
+        value = Regex.Replace(value, @"\\\\(?=[A-Za-z])", "\\");
         value = value.Replace("&lt;", "<").Replace("&gt;", ">").Replace("&le;", "≤").Replace("&ge;", "≥");
         // MathJax 接受 \lt/\gt，但 Word 与部分 WPS 公式引擎会把它们显示为原文。
         // 在选择渲染路径前统一为标准关系符，确保行内、行间和矩阵都一致。
@@ -3041,19 +3617,182 @@ public sealed class OfficeDocumentService
         // 浏览器复制时偶尔会给普通运算符多加一个反斜杠，例如 \<、\-。
         value = Regex.Replace(value, @"\\(?=[<>=+\-*/])", String.Empty);
         value = Regex.Replace(value, @"([<>])\s*-\s*(?=[\\\d(])", "$1 -");
+        // Some WPS/clipboard paths rewrite TeX environment braces as
+        // parentheses: ``\begin(align *) ... \end(align *)``.  Restore the
+        // canonical environment spelling before row extraction and OMML
+        // generation; the surrounding formula text remains untouched.
+        value = NormalizeParenthesizedLatexEnvironments(value);
         value = RemoveUnmatchedLatexBraces(value);
+        // Doubao/DeepSeek frequently emits function and accent arguments with
+        // round parentheses (for example ``\vec(TA)`` or ``\overline(z)``)
+        // instead of TeX groups.  The OMML parser intentionally accepts the
+        // TeX form only, so canonicalize balanced parenthesized arguments
+        // before any formula is sent to Word/WPS.  This also keeps the linear
+        // fallback and the direct OMML path in agreement.
+        value = NormalizeParenthesizedLatexArguments(value);
         value = value.Replace("\\mleft", "\\left").Replace("\\mright", "\\right");
         value = Regex.Replace(value,
             @"\\(?:Biggl|Biggr|biggl|biggr|Biggm|biggm|Bigl|Bigr|bigl|bigr|Bigm|bigm|Bigg|bigg|Big|big)\b\s*",
             String.Empty);
         value = Regex.Replace(value,
-            @"\\(?:middle|displaystyle|textstyle|scriptstyle|scriptscriptstyle|limits|nolimits)\b\s*",
+            @"\\(?:middle|left|right|displaystyle|textstyle|scriptstyle|scriptscriptstyle|limits|nolimits)\b\s*",
             String.Empty);
+        // A few clients wrap the parenthesized argument in ``\left``/``\right``;
+        // after those display-only commands are removed, run the canonicalizer
+        // once more so ``\vec\left(TA\right)`` follows the same path as
+        // ``\vec(TA)``.
+        value = NormalizeParenthesizedLatexArguments(value);
         value = value.Replace("\\dfrac", "\\frac").Replace("\\tfrac", "\\frac");
         value = value.Replace("\\operatorname*", "\\operatorname");
         value = RepairSingleLatexRowSeparators(value);
         value = NormalizeBareFractionSyntax(value);
         return value.Trim();
+    }
+
+    /// <summary>
+    /// Rewrites a selected set of unary/binary TeX commands whose argument is
+    /// written as a balanced parenthesized expression into a normal braced
+    /// argument.  It deliberately does not touch ordinary functions such as
+    /// <c>\sin(x)</c>; Word's math parser already handles those naturally.
+    /// </summary>
+    private static string NormalizeParenthesizedLatexArguments(string source)
+    {
+        if (String.IsNullOrEmpty(source)) return source ?? String.Empty;
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "sqrt", "vec", "overline", "bar", "underline", "overrightarrow",
+            "overleftarrow", "underrightarrow", "underleftarrow", "widehat",
+            "widetilde", "hat", "tilde", "wideparen", "overparen", "dot",
+            "ddot", "breve", "check", "acute", "grave", "boxed", "cancel",
+            "bcancel", "xcancel", "overbrace", "underbrace", "text", "textrm",
+            "mathrm", "mathbf", "mathit", "mathsf", "mathtt", "mathbb",
+            "mathcal", "mathfrak", "boldsymbol", "bm", "pmb", "mathnormal",
+            "operatorname", "pmod", "pod", "frac", "dfrac", "tfrac", "cfrac",
+            "binom", "overset", "stackrel", "underset", "textcolor", "color"
+        };
+        var binaryNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "frac", "dfrac", "tfrac", "cfrac", "binom", "overset", "stackrel",
+            "underset", "textcolor", "color"
+        };
+        var output = new StringBuilder(source.Length + 16);
+        var index = 0;
+        while (index < source.Length)
+        {
+            if (source[index] != '\\')
+            {
+                output.Append(source[index++]);
+                continue;
+            }
+
+            var nameStart = index + 1;
+            var nameEnd = nameStart;
+            while (nameEnd < source.Length && Char.IsLetter(source[nameEnd])) nameEnd++;
+            if (nameEnd == nameStart)
+            {
+                output.Append(source[index++]);
+                continue;
+            }
+
+            var name = source.Substring(nameStart, nameEnd - nameStart);
+            output.Append(source, index, nameEnd - index);
+            index = nameEnd;
+            if (!names.Contains(name)) continue;
+            while (index < source.Length && Char.IsWhiteSpace(source[index]))
+            {
+                output.Append(source[index++]);
+            }
+            if (String.Equals(name, "sqrt", StringComparison.OrdinalIgnoreCase) &&
+                index < source.Length && source[index] == '[')
+            {
+                var optionalClose = FindBalancedClosingBracket(source, index);
+                if (optionalClose > index)
+                {
+                    output.Append(source, index, optionalClose - index + 1);
+                    index = optionalClose + 1;
+                    while (index < source.Length && Char.IsWhiteSpace(source[index]))
+                        output.Append(source[index++]);
+                }
+            }
+            if (index >= source.Length ||
+                source[index] != '(' && !(binaryNames.Contains(name) && source[index] == '{')) continue;
+
+            var argumentCount = binaryNames.Contains(name) ? 2 : 1;
+            for (var argument = 0; argument < argumentCount; argument++)
+            {
+                while (index < source.Length && Char.IsWhiteSpace(source[index]))
+                    output.Append(source[index++]);
+                if (binaryNames.Contains(name) && index < source.Length && source[index] == '{')
+                {
+                    string existing;
+                    int existingEnd;
+                    if (TryReadGroup(source, index, out existing, out existingEnd))
+                    {
+                        output.Append(source, index, existingEnd - index);
+                        index = existingEnd;
+                        continue;
+                    }
+                }
+                if (index >= source.Length || source[index] != '(') break;
+                var close = FindBalancedClosingParenthesis(source, index);
+                if (close <= index) break;
+                output.Append('{');
+                output.Append(source, index + 1, close - index - 1);
+                output.Append('}');
+                index = close + 1;
+            }
+        }
+        return output.ToString();
+    }
+
+    private static string NormalizeParenthesizedLatexEnvironments(string source)
+    {
+        if (String.IsNullOrEmpty(source)) return source ?? String.Empty;
+        return Regex.Replace(source,
+            @"\\(?<kind>begin|end)\s*\(\s*(?<name>[A-Za-z]+\s*\*?)\s*\)",
+            match => "\\" + match.Groups["kind"].Value + "{" +
+                     Regex.Replace(match.Groups["name"].Value, @"\s+", String.Empty) + "}",
+            RegexOptions.IgnoreCase);
+    }
+
+    private static int FindBalancedClosingParenthesis(string source, int open)
+    {
+        if (String.IsNullOrEmpty(source) || open < 0 || open >= source.Length || source[open] != '(')
+            return -1;
+        var depth = 0;
+        for (var index = open; index < source.Length; index++)
+        {
+            var character = source[index];
+            if (character == '\\')
+            {
+                // A parenthesis escaped by TeX is a literal delimiter, not a
+                // grouping marker.  Skip the escaped character while scanning.
+                if (index + 1 < source.Length) index++;
+                continue;
+            }
+            if (character == '(') depth++;
+            else if (character == ')' && --depth == 0) return index;
+        }
+        return -1;
+    }
+
+    private static int FindBalancedClosingBracket(string source, int open)
+    {
+        if (String.IsNullOrEmpty(source) || open < 0 || open >= source.Length || source[open] != '[')
+            return -1;
+        var depth = 0;
+        for (var index = open; index < source.Length; index++)
+        {
+            var character = source[index];
+            if (character == '\\')
+            {
+                if (index + 1 < source.Length) index++;
+                continue;
+            }
+            if (character == '[') depth++;
+            else if (character == ']' && --depth == 0) return index;
+        }
+        return -1;
     }
 
     private static string NormalizeClipboardCharacters(string source)
@@ -3736,7 +4475,7 @@ public sealed class OfficeDocumentService
             var name = rawName.ToLowerInvariant();
             var body = environment.Groups["body"].Value.Trim();
             if (Regex.IsMatch(body, @"^\\begin\s*\{", RegexOptions.IgnoreCase)) return PrepareLatexRows(body);
-            var rows = Regex.Split(body, @"\\\\(?=\s|\\|$|[0-9+\-(]|(?!(?:sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|frac|dfrac|tfrac|cfrac|sqrt|text|mathrm|mathbf|mathit|mathsf|mathtt|operatorname|left|right|begin|end|alpha|beta|gamma|delta|epsilon|theta|lambda|mu|nu|xi|pi|rho|sigma|tau|phi|varphi|omega|sum|prod|int|lim|log|ln|exp|quad|qquad|cdot|times)\b)[A-Za-z])", RegexOptions.IgnoreCase)
+            var rows = Regex.Split(body, @"\\\\(?=\s|\\|$|[0-9+\-(]|(?!(?:sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|frac|dfrac|tfrac|cfrac|sqrt|text|mathrm|mathbf|mathit|mathsf|mathtt|operatorname|left|right|begin|end|alpha|beta|gamma|delta|epsilon|theta|lambda|mu|nu|xi|pi|rho|sigma|tau|phi|varphi|omega|sum|prod|int|lim|log|lg|lb|ln|exp|quad|qquad|cdot|times)\b)[A-Za-z])", RegexOptions.IgnoreCase)
                 .Select(row => NormalizeAiEscapes(row).Trim().TrimEnd('\\').Trim())
                 .Where(row => row.Length > 0)
                 .ToArray();
@@ -3853,7 +4592,7 @@ public sealed class OfficeDocumentService
         value = value.Replace("\\,", " ").Replace("\\;", " ").Replace("\\!", String.Empty);
         value = value.Replace("\\%", "%").Replace("\\#", "#").Replace("\\&", "&");
         value = Regex.Replace(value,
-            @"\\(?<name>arcsin|arccos|arctan|sinh|cosh|tanh|coth|sin|cos|tan|cot|sec|csc|limsup|liminf|lim|log|ln|exp|min|max|sup|inf|det|gcd|lcm|rank|diag|span|sgn|tr|ker|dim|arg|Pr|Var|Cov)(?![A-Za-z])",
+            @"\\(?<name>arcsin|arccos|arctan|arcsec|arccsc|arccot|sinh|cosh|tanh|coth|sin|cos|tan|cot|sec|csc|limsup|liminf|lim|log|lg|lb|ln|exp|min|max|sup|inf|det|gcd|lcm|rank|diag|span|sgn|tr|ker|dim|arg|Pr|Var|Cov)(?![A-Za-z])",
             match => " " + match.Groups["name"].Value + " ", RegexOptions.IgnoreCase);
         // 箭头命令必须先于 \le/\ge 等短命令处理；否则 \leftarrow 会被
         // \le 的前缀替换破坏成“≤ftarrow”。
@@ -3889,8 +4628,12 @@ public sealed class OfficeDocumentService
         // 尤其出现在绝对值或较长表达式中时会停留在线性格式。
         // 单原子脚本改写为 _a/^2，复杂脚本仍用括号保护作用域。
         value = NormalizeUnicodeMathScriptGroups(value);
+        // Keep escaped TeX braces as escaped braces.  Restoring them as bare
+        // ``{``/``}`` makes Word treat a set literal as a grouping construct,
+        // which drops the visible braces in expressions such as
+        // ``\{x\mid x>0\}``.
         value = value.Replace("\\{", "\uE100").Replace("\\}", "\uE101");
-        value = value.Replace("{", "(").Replace("}", ")").Replace("\uE100", "{").Replace("\uE101", "}");
+        value = value.Replace("{", "(").Replace("}", ")").Replace("\uE100", "\\{").Replace("\uE101", "\\}");
         return RemoveUnmatchedClosingParentheses(Regex.Replace(value, @"[ \t]+", " ").Trim());
     }
 
@@ -3924,14 +4667,12 @@ public sealed class OfficeDocumentService
 
     private static string BuildLinearFraction(string numerator, string denominator)
     {
-        // UnicodeMath treats a bare "(a)/(b)" as a division whose numerator may
-        // extend back to the beginning of the surrounding expression.  This is
-        // especially visible in formulas such as
-        //   \exists\varphi,\forall x,...+2\sin\frac{\varphi}{2}
-        // where Word incorrectly places the whole quantified prefix in the
-        // numerator.  U+3016/U+3017 are UnicodeMath's invisible grouping marks:
-        // they keep the fraction as one atom without adding visible parentheses.
-        return "\u3016(" + (numerator ?? String.Empty) + ")/(" + (denominator ?? String.Empty) + ")\u3017";
+        // Group both sides explicitly.  Earlier versions used U+3016/U+3017
+        // as supposedly invisible grouping marks; WPS and some Word fonts
+        // render those code points as visible corner brackets (the stray
+        // ``〘...〙`` seen in converted choices).  Nested ordinary parentheses
+        // keep the fraction local without leaking those markers to users.
+        return "((" + (numerator ?? String.Empty) + ")/(" + (denominator ?? String.Empty) + "))";
     }
 
     private static string NormalizeSingleArgumentCommands(string source)
@@ -4025,19 +4766,57 @@ public sealed class OfficeDocumentService
     private static string RemoveUnmatchedClosingParentheses(string source)
     {
         if (String.IsNullOrEmpty(source)) return source ?? String.Empty;
-        var depth = 0;
+        var parenthesisDepth = 0;
+        var squareDepth = 0;
+        var braceDepth = 0;
         var builder = new StringBuilder(source.Length);
-        foreach (var character in source)
+        for (var index = 0; index < source.Length; index++)
         {
+            var character = source[index];
+            var escaped = index > 0 && source[index - 1] == '\\';
+            if (escaped)
+            {
+                var slashCount = 0;
+                for (var cursor = index - 1; cursor >= 0 && source[cursor] == '\\'; cursor--) slashCount++;
+                escaped = (slashCount % 2) == 1;
+            }
+            if (escaped)
+            {
+                builder.Append(character);
+                continue;
+            }
             if (character == '(')
             {
-                depth++;
+                parenthesisDepth++;
                 builder.Append(character);
             }
             else if (character == ')')
             {
-                if (depth == 0) continue;
-                depth--;
+                if (parenthesisDepth > 0) parenthesisDepth--;
+                else if (squareDepth > 0) squareDepth--; // interval [a,b)
+                else continue;
+                builder.Append(character);
+            }
+            else if (character == '[') { squareDepth++; builder.Append(character); }
+            else if (character == ']')
+            {
+                if (squareDepth > 0) squareDepth--;
+                else if (parenthesisDepth > 0)
+                {
+                    // Intervals may close with a square bracket after an
+                    // opening parenthesis, e.g. ``(-1/2,0]``.  Treat that
+                    // bracket as the mate of the outstanding interval opener
+                    // instead of dropping it as an unmatched square group.
+                    parenthesisDepth--;
+                }
+                else continue;
+                builder.Append(character);
+            }
+            else if (character == '{') { braceDepth++; builder.Append(character); }
+            else if (character == '}')
+            {
+                if (braceDepth == 0) continue;
+                braceDepth--;
                 builder.Append(character);
             }
             else builder.Append(character);

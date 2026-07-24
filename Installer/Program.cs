@@ -16,7 +16,7 @@ internal static class Program
     private const string LegacyProgId = "OfflineOfficeAddIn.Connect";
     private const string ManagedCategory = "{62C8FE65-4EBB-45E7-B440-6E39B2CDBF29}";
     private const string ProductName = "AI规范化";
-    private const string PackageVersion = "1.1.7";
+    private const string PackageVersion = "1.1.8";
     private static readonly string ProjectUrl = "https://github.com/" + ReadResourceText("Payload.ProjectRepository.txt");
     private const string UninstallKey = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\AIGFH";
     private const int NetFramework48Release = 528040;

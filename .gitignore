@@ -17,5 +17,10 @@ verify-*
 fixture-*
 
 dist/*
-!dist/AI规范化-Pot0001-1.1.7.exe
+!dist/AI规范化-Pot0001-1.1.8.exe
 !dist/SHA256SUMS.txt
+
+tmp-*
+tmp_*
+Normalize*.out.txt
+mathtype_vba.txt
